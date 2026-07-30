@@ -439,6 +439,7 @@ let rawModelMulti = false;                 // true when per-part texture names a
 
 let needComposite = true;
 let needDraw = true;
+let wandCache = null;   // cached composite pixels for the magic wand / quick select
 function invalidate() { needComposite = true; needDraw = true; wandCache = null; }
 
 /* ---------------- layers ---------------- */
@@ -849,8 +850,11 @@ function dashRect(x0, y0, x1, y1, color) {
 function drawOverlays() {
   drawSelectionAnts();
 
-  // live marquee
-  if (marqueeLive) {
+  // live marquee / drag rectangle preview
+  const marqueeLive = dragShape ? Object.assign({}, dragShape, {
+    shape: (tool === 'marqEll' || tool === 'shapeEll') ? 'ellipse' : 'rect'
+  }) : null;
+  if (marqueeLive && (SEL_TOOLS.has(tool) || DRAG_TOOLS.has(tool) || SHAPE_TOOLS.has(tool))) {
     const m = marqueeLive;
     if (m.shape === 'ellipse') {
       const a = tex2scr(Math.min(m.x0, m.x1), Math.min(m.y0, m.y1));
@@ -878,7 +882,7 @@ function drawOverlays() {
     if (lassoCursor) { const s = tex2scr(lassoCursor[0], lassoCursor[1]); vctx.lineTo(s[0], s[1]); }
     vctx.stroke();
     vctx.restore();
-    if (tool === 'lasso-poly' || tool === 'lasso-magnetic') {
+    if (tool === 'polyLasso' || tool === 'magLasso') {
       vctx.fillStyle = 'var(--amber)';
       lassoPts.forEach(p => {
         const s = tex2scr(p[0], p[1]);
@@ -1004,10 +1008,8 @@ function drawOverlays() {
     vctx.restore();
   }
 
-  // live shape
-  if (shapeLive) dashRect(shapeLive.x0, shapeLive.y0, shapeLive.x1, shapeLive.y1, 'rgba(245,165,36,.9)');
-
-  // gradient guide
+  // gradient guide (while dragging with the gradient tool)
+  const gradLine = (dragShape && tool === 'grad') ? dragShape : null;
   if (gradLine) {
     const a = tex2scr(gradLine.x0, gradLine.y0), b = tex2scr(gradLine.x1, gradLine.y1);
     vctx.save();
@@ -1033,8 +1035,8 @@ function drawOverlays() {
 
   // crop: dim everything outside the box
   if (cropRect) {
-    const a = tex2scr(Math.min(cropRect.x0, cropRect.x1), Math.min(cropRect.y0, cropRect.y1));
-    const b = tex2scr(Math.max(cropRect.x0, cropRect.x1), Math.max(cropRect.y0, cropRect.y1));
+    const a = tex2scr(cropRect.x, cropRect.y);
+    const b = tex2scr(cropRect.x + cropRect.w, cropRect.y + cropRect.h);
     const dpr = window.devicePixelRatio || 1;
     const w = viewEl.width / dpr, h = viewEl.height / dpr;
     vctx.save();
@@ -1074,15 +1076,15 @@ function drawOverlays() {
   }
 
   // symmetry guides
-  if ((opt.mirrorX || opt.mirrorY) && BRUSHY.has(tool)) {
+  if ((opt.symX || opt.symY) && BRUSHY.has(tool)) {
     vctx.save();
     vctx.strokeStyle = 'rgba(245,165,36,.35)';
     vctx.setLineDash([6, 6]);
-    if (opt.mirrorX) {
+    if (opt.symX) {
       const s = tex2scr(TW / 2, 0), e = tex2scr(TW / 2, TH);
       vctx.beginPath(); vctx.moveTo(s[0], s[1]); vctx.lineTo(e[0], e[1]); vctx.stroke();
     }
-    if (opt.mirrorY) {
+    if (opt.symY) {
       const s = tex2scr(0, TH / 2), e = tex2scr(TW, TH / 2);
       vctx.beginPath(); vctx.moveTo(s[0], s[1]); vctx.lineTo(e[0], e[1]); vctx.stroke();
     }
@@ -1224,8 +1226,11 @@ function finishSelection() {
 
 // magic wand / quick selection helper: flood the composite by color similarity
 function wandMask(sx, sy, tol, contiguous) {
-  compositeAll();
-  const img = compCtx.getImageData(0, 0, TW, TH);
+  if (!wandCache) {
+    compositeAll();
+    wandCache = compCtx.getImageData(0, 0, TW, TH);
+  }
+  const img = wandCache;
   const d = img.data;
   const i0 = (sy * TW + sx) * 4;
   const tr = d[i0], tg = d[i0 + 1], tb = d[i0 + 2], ta = d[i0 + 3];
@@ -1416,12 +1421,16 @@ const groupActive = GROUPS.map(g => g.ids[0]);
 
 const SEL_TOOLS = new Set(['marqRect', 'marqEll', 'marqRow', 'marqCol', 'lasso', 'polyLasso', 'magLasso', 'wand', 'quickSel', 'objSel']);
 const PAINT_TOOLS = new Set(['brush', 'pencil', 'eraser', 'clone']);
+// tools whose in-progress stroke is previewed from strokeCanvas
+const STROKE_PREVIEW = new Set(['brush', 'pencil', 'eraser', 'clone']);
+// tools that show a round brush cursor and obey mirror painting
 const SHAPE_TOOLS = new Set(['shapeRect', 'shapeEll', 'shapeTri', 'shapePoly', 'shapeLine', 'shapeCustom']);
 const PEN_TOOLS = new Set(['pen', 'freepen', 'curvpen', 'addAnchor', 'delAnchor', 'convAnchor', 'pathSel', 'directSel']);
 const TEXT_TOOLS = new Set(['text', 'textV', 'typeMask', 'typeMaskV']);
 const SHAPE_KIND = { shapeRect: 'rect', shapeEll: 'ellipse', shapeTri: 'tri', shapePoly: 'poly', shapeLine: 'line', shapeCustom: 'custom' };
 const DRAG_TOOLS = new Set(['grad', 'crop', 'cropPersp', 'slice', 'zoom', 'ruler', 'frame', 'objSel']);
 const PIXEL_TOOLS = new Set(['heal', 'spotheal', 'smudge', 'blur', 'sharpen', 'dodge', 'burn', 'colorrep', 'sponge', 'redeye', 'bgeraser', 'mixer', 'histbrush', 'arthist', 'patstamp']);
+const BRUSHY = new Set([...PAINT_TOOLS, ...PIXEL_TOOLS, 'quickSel']);
 
 function groupOf(id) { return GROUPS.findIndex(g => g.ids.includes(id)); }
 
@@ -1838,7 +1847,8 @@ let panning = false, panStart = null;
 let spaceHeld = false;
 let moving = null;
 let dragShape = null;     // {x0,y0,x1,y1} for shapes / gradients / marquees / crop / zoom
-let polyPts = null;       // polygonal lasso points
+let polyPts = null;           // polygonal lasso points
+let lassoCursor = null;       // live cursor for an open lasso / polygon path
 let cropRect = null;
 let rulerLine = null;
 let selDragMode = 'new';
@@ -2746,97 +2756,6 @@ viewEl.addEventListener('pointerdown', e => {
   if (tool === 'fill') {
     if (e.altKey) { pickColor(tx, ty, true); return; }
     floodFill(tx, ty);
-  } else if (tool === 'mixer') {
-    rows.push(colorRow('optColor', 'Color', opt.color));
-    rows.push(range('optSize', 'Size', 1, 500, opt.size, 'px', 1, 1, 2000));
-    rows.push(range('optWet', 'Wet', 0, 100, Math.round(opt.wet * 100), '%'));
-    rows.push(range('optStrength', 'Flow', 1, 100, Math.round(opt.strength * 100), '%'));
-    rows.push(note('Blends your colour into what is already on the layer as you drag.'));
-  } else if (tool === 'sponge') {
-    rows.push(range('optSize', 'Size', 1, 500, opt.size, 'px', 1, 1, 2000));
-    rows.push(range('optStrength', 'Flow', 1, 100, Math.round(opt.strength * 100), '%'));
-    rows.push(`<div class="opt"><label for="optSponge">Mode</label><select id="optSponge">
-      <option value="desaturate" ${opt.spongeMode === 'desaturate' ? 'selected' : ''}>Desaturate</option>
-      <option value="saturate" ${opt.spongeMode === 'saturate' ? 'selected' : ''}>Saturate</option></select></div>`);
-  } else if (tool === 'redeye') {
-    rows.push(range('optSize', 'Size', 1, 500, opt.size, 'px', 1, 1, 2000));
-    rows.push(range('optStrength', 'Amount', 1, 100, Math.round(opt.strength * 100), '%'));
-    rows.push(note('Paint over red pixels to neutralise them — also handy for killing red colour fringing.'));
-  } else if (tool === 'bgeraser') {
-    rows.push(range('optSize', 'Size', 1, 500, opt.size, 'px', 1, 1, 2000));
-    rows.push(range('optTol', 'Tolerance', 0, 160, opt.tolerance, '', 1, 0, 255));
-    rows.push(note('Erases only pixels matching the colour at the centre of the brush — great for cutting logos off a background.'));
-  } else if (tool === 'mageraser') {
-    rows.push(range('optTol', 'Tolerance', 0, 160, opt.tolerance, '', 1, 0, 255));
-    rows.push(check('optContig', 'Contiguous', opt.contiguous));
-    rows.push(note('Click to delete a whole area of similar colour.'));
-  } else if (tool === 'histbrush' || tool === 'arthist') {
-    rows.push(range('optSize', 'Size', 1, 500, opt.size, 'px', 1, 1, 2000));
-    rows.push(range('optOpacity', 'Opacity', 1, 100, Math.round(opt.opacity * 100), '%'));
-    rows.push('<button class="chip-btn" id="btnSnap">Take snapshot</button>');
-    rows.push(note(histSnap ? 'Painting restores the snapshot' + (tool === 'arthist' ? ' with stylised swirls.' : '.') : 'Take a snapshot first, edit away, then paint the original back.'));
-  } else if (tool === 'patstamp') {
-    rows.push(range('optSize', 'Size', 1, 500, opt.size, 'px', 1, 1, 2000));
-    rows.push(range('optOpacity', 'Opacity', 1, 100, Math.round(opt.opacity * 100), '%'));
-    rows.push('<button class="chip-btn" id="btnPatSel">Pattern from selection</button>');
-    rows.push('<button class="chip-btn" id="btnPatFile">Pattern from image…</button>');
-    rows.push(note(patternData ? 'Pattern: ' + patternName : 'Capture a pattern first (a selected area, or an image file).'));
-  } else if (tool === 'camove') {
-    rows.push(note('With a selection active, drag it to a new spot — the hole left behind is filled from its surroundings.'));
-  } else if (PEN_TOOLS.has(tool)) {
-    if (tool === 'pen' || tool === 'curvpen' || tool === 'freepen') {
-      rows.push(colorRow('optColor', 'Color', opt.color));
-      rows.push(range('optShapeStrokeW', 'Stroke', 1, 120, opt.shapeStrokeW, 'px', 1, 1, 400));
-    }
-    rows.push('<button class="chip-btn" id="btnPathStroke">Stroke path</button>');
-    rows.push('<button class="chip-btn" id="btnPathFill">Fill path</button>');
-    rows.push('<button class="chip-btn" id="btnPathSel">Path → selection</button>');
-    rows.push('<button class="chip-btn" id="btnPathSave">Save path</button>');
-    rows.push('<button class="chip-btn" id="btnPathClear">Clear</button>');
-    rows.push(note(penAnchors.length ? penAnchors.length + ' points · click the first point to close · Enter strokes it' :
-      tool === 'freepen' ? 'Drag to draw a freehand path.' :
-      tool === 'curvpen' ? 'Click points — curves are smoothed automatically.' :
-      tool === 'pen' ? 'Click for corners, click-drag to pull a curve.' : 'Draw a path with the pen first.'));
-  } else if (tool === 'slice' || tool === 'sliceSel') {
-    rows.push(note(slices.length + ' slice' + (slices.length === 1 ? '' : 's') + ' defined · drag to add, Alt+click a slice to delete.'));
-    rows.push('<button class="chip-btn" id="btnSliceExport">Export slices as PNG</button>');
-    rows.push('<button class="chip-btn" id="btnSliceClear">Clear slices</button>');
-  } else if (tool === 'cropPersp') {
-    if (perspPts) {
-      rows.push('<button class="chip-btn" id="btnPerspApply">Apply perspective crop</button>');
-      rows.push('<button class="chip-btn" id="btnPerspCancel">Cancel</button>');
-      rows.push(note('Drag the four amber corners onto the corners of the shape you want squared up.'));
-    } else rows.push(note('Drag a box over the area, then nudge the corners to match the perspective.'));
-  } else if (tool === 'frame') {
-    rows.push(`<div class="opt"><label for="optFrameShape">Shape</label><select id="optFrameShape">
-      <option value="rect" ${opt.frameShape === 'rect' ? 'selected' : ''}>Rectangle</option>
-      <option value="ell" ${opt.frameShape === 'ell' ? 'selected' : ''}>Ellipse</option></select></div>`);
-    rows.push(note('Drag out a frame, then choose an image — it is clipped to the frame and stays re-placeable.'));
-  } else if (tool === 'sampler') {
-    if (samplers.length) {
-      rows.push('<div class="opt">' + samplers.map((s, i) =>
-        `<span class="samp-chip"><i style="background:${s.hex}"></i>#${i + 1} ${s.hex} <b>${s.rgb.join(',')}</b></span>`).join('') + '</div>');
-      rows.push('<button class="chip-btn" id="btnSampClear">Clear points</button>');
-    } else rows.push(note('Click up to four points to keep an eye on their colour values. Alt+click clears them.'));
-  } else if (tool === 'note') {
-    rows.push(note(notes.length + ' note' + (notes.length === 1 ? '' : 's') + ' · click to add one, Alt+click a marker to remove it.'));
-    if (notes.length) rows.push('<button class="chip-btn" id="btnNoteClear">Clear notes</button>');
-  } else if (tool === 'count') {
-    rows.push('<span class="opt"><label>Count</label><span class="val-in" style="text-align:center">' + counts.length + '</span></span>');
-    rows.push(note('Click to tally items, Alt+click a marker to remove it.'));
-    if (counts.length) rows.push('<button class="chip-btn" id="btnCountClear">Reset count</button>');
-  } else if (tool === 'pick3d') {
-    rows.push(note('Click here, then click the model in the 3D preview — the 2D view jumps to that exact texture pixel and samples its colour.'));
-  } else if (tool === 'rotView') {
-    rows.push(range('optRotView', 'Angle', -180, 180, Math.round(view.rot || 0), '°', 1, -360, 360));
-    rows.push('<button class="chip-btn" id="btnRotReset">Reset to 0°</button>');
-    rows.push(note('Rotates the canvas view only — your texture is untouched.'));
-  } else if (tool === 'objSel') {
-    rows.push(range('optTol', 'Tolerance', 0, 160, opt.tolerance, '', 1, 0, 255));
-    rows.push(note('Drag a loose box around an object; the background-ish edges get dropped from the selection.'));
-  } else if (tool === 'magLasso') {
-    rows.push(range('optSize', 'Snap radius', 4, 90, opt.size, 'px', 1, 3, 200));
-    rows.push(note('Trace near an edge — points snap to the strongest contrast nearby.'));
   } else if (tool === 'picker') {
     pickColor(tx, ty);
   } else if (TEXT_TOOLS.has(tool)) {
@@ -2932,6 +2851,7 @@ viewEl.addEventListener('pointermove', e => {
     needDraw = true;
     return;
   }
+  if (polyPts || (strokeActive && (tool === 'lasso' || tool === 'magLasso'))) lassoCursor = [tx, ty];
   if (strokeActive && tool === 'magLasso') {
     const last = lassoPts[lassoPts.length - 1];
     if (Math.hypot(tx - last[0], ty - last[1]) > 4 / view.scale) lassoPts.push(snapToEdge(tx, ty));
@@ -2969,6 +2889,7 @@ viewEl.addEventListener('pointermove', e => {
 });
 
 function closePolyLasso() {
+  lassoCursor = null;
   if (polyPts && polyPts.length > 2) {
     const pts = polyPts.slice();
     applySelShape(c => {
@@ -3063,55 +2984,6 @@ function endPointer() {
     floatSel = null;
     invalidate();
   }
-  if (perspDrag !== null && perspPts) {
-    perspPts[perspDrag].x = tx;
-    perspPts[perspDrag].y = ty;
-    needDraw = true;
-    return;
-  }
-  if (sliceDrag) {
-    const s = slices[sliceDrag.i];
-    s.x = Math.round(sliceDrag.ox + (tx - sliceDrag.sx));
-    s.y = Math.round(sliceDrag.oy + (ty - sliceDrag.sy));
-    needDraw = true;
-    return;
-  }
-  if (rotDrag) {
-    view.rot = rotDrag.start + (mx - rotDrag.mx) * 0.4;
-    needDraw = true;
-    return;
-  }
-  if (penDrag) {
-    const a = penAnchors[penDrag.i];
-    if (penDrag.mode === 'all') {
-      const dx = tx - penDrag.sx, dy = ty - penDrag.sy;
-      penAnchors.forEach(p => { p.x += dx; p.y += dy; });
-      penDrag.sx = tx; penDrag.sy = ty;
-    } else if (penDrag.mode === 'point' && a) {
-      a.x = tx; a.y = ty;
-    } else if (a) {           // newhandle / handle: pull a bezier handle out
-      a.hx = tx - a.x; a.hy = ty - a.y;
-      if (Math.hypot(a.hx, a.hy) * view.scale < 3) { delete a.hx; delete a.hy; }
-    }
-    needDraw = true;
-    return;
-  }
-  if (PEN_TOOLS.has(tool) && (tool === 'pen' || tool === 'curvpen') && penAnchors.length) {
-    penCursor = [tx, ty];
-    needDraw = true;
-  }
-  if (strokeActive && tool === 'freepen') {
-    const last = penAnchors[penAnchors.length - 1];
-    if (!last || Math.hypot(tx - last.x, ty - last.y) > 6 / view.scale) penAnchors.push({ x: tx, y: ty });
-    needDraw = true;
-    return;
-  }
-  if (strokeActive && tool === 'magLasso') {
-    const last = lassoPts[lassoPts.length - 1];
-    if (Math.hypot(tx - last[0], ty - last[1]) > 4 / view.scale) lassoPts.push(snapToEdge(tx, ty));
-    needDraw = true;
-    return;
-  }
   if (perspDrag !== null) { perspDrag = null; needDraw = true; }
   if (sliceDrag) { sliceDrag = null; needDraw = true; }
   if (rotDrag) { rotDrag = null; syncOptions(); }
@@ -3131,6 +3003,7 @@ function endPointer() {
     if (tool === 'lasso' || tool === 'magLasso') {
       const pts = lassoPts;
       lassoPts = null;
+      lassoCursor = null;
       strokeActive = false;
       if (pts && pts.length > 2) applySelShape(c => {
         c.beginPath();
@@ -5989,6 +5862,14 @@ window.addEventListener('drop', e => {
     hs.addEventListener('pointercancel', up);
   });
 })();
+
+window.addEventListener('error', ev => {
+  try {
+    const msg = (ev.error && ev.error.message) ? ev.error.message : ev.message;
+    toast('Internal error: ' + msg, 'err', 9000);
+    console.error(ev.error || ev.message);
+  } catch (e) { /* never let the reporter itself break things */ }
+});
 
 buildToolRail();
 makeChecker();
