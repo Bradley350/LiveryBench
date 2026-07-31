@@ -267,7 +267,8 @@ hidden-inputs{display:none}
       <div id="dropHint">
         <div class="big">DROP FILES ANYWHERE</div>
         <div class="small">
-          <b>Model:</b> .obj · .glb · .gltf · .yft / .ydr (experimental)<br>
+          <b>Vehicles:</b> .obj · .glb · .gltf · .yft / .ydr (experimental)<br>
+          <b>EUP / clothing:</b> .ydd (experimental)<br>
           <b>Texture:</b> .png · .jpg · .dds · .ytd (experimental)<br>
           <b>Project:</b> .lbproj (everything, layers intact)<br><br>
           Tip: export your model once from CodeWalker as OBJ for the most reliable preview,
@@ -350,7 +351,7 @@ hidden-inputs{display:none}
 </main>
 
 <hidden-inputs>
-  <input type="file" id="fileModel" accept=".obj,.glb,.gltf,.yft,.ydr">
+  <input type="file" id="fileModel" accept=".obj,.glb,.gltf,.yft,.ydr,.ydd">
   <input type="file" id="fileTex" accept=".png,.jpg,.jpeg,.webp,.dds,.ytd,.lbproj">
   <input type="file" id="fileDecal" accept=".png,.jpg,.jpeg,.webp,.dds">
 </hidden-inputs>
@@ -431,7 +432,8 @@ const strokeCtx = ctx2d(strokeCanvas);
 const scratch = makeCanvas(TW, TH);        // temp for eraser preview / moves
 const scratchCtx = ctx2d(scratch);
 const uvCanvas = makeCanvas(TW, TH);       // uv wireframe overlay
-let uvVisible = false;
+let uvVisible = false;   // overlay on/off
+let uvMode = 1;          // 1 = only parts using this texture, 2 = every part
 let uvSourceGeos = null;                   // overlay-space uvs (computed)
 const scratch2 = makeCanvas(TW, TH);       // clipping / floating pixels
 let rawModelGeos = null;                   // parsed model geometry (three-space uvs)
@@ -1318,6 +1320,7 @@ const opt = {
   symX: false, symY: false,
   wet: 0.6, spongeMode: 'desaturate', sampleSize: 1,
   starRatio: 0, corner: 0, arrow: false, custom: 'chevron',
+  repMatch: 'shades', repShade: true, repScope: 'layer',
   penMode: 'path', frameShape: 'rect',
   antialias: true
 };
@@ -1376,6 +1379,7 @@ const TOOLDEFS = {
   textV: { label: 'Vertical type', icon: '<path d="M5 4h14M12 4v16M8 8h.01M16 8h.01"/>' },
   typeMask: { label: 'Type mask (text → selection)', icon: '<path stroke-dasharray="3 2" d="M3 4h18v16H3z"/><path d="M8 9V8h8v1M12 8v8"/>' },
   typeMaskV: { label: 'Vertical type mask', icon: '<path stroke-dasharray="3 2" d="M3 4h18v16H3z"/><path d="M9 7h6M12 7v10"/>' },
+  bucketRep: { label: 'Replace colour (click a colour to swap it everywhere)', icon: '<path d="M4 12.5 11 5.5a1.5 1.5 0 0 1 2.1 0l4.4 4.4a1.5 1.5 0 0 1 0 2.1l-4.6 4.6a3 3 0 0 1-4.2 0z"/><path d="M9.5 4 8 2.5"/><path d="M19.5 15.5s1.7 2 1.7 3.3a1.7 1.7 0 0 1-3.4 0c0-1.3 1.7-3.3 1.7-3.3z"/><path d="M3 20.5h7"/>' },
   shapeRect: { label: 'Rectangle', icon: '<rect x="3" y="5" width="18" height="14" rx="1"/>' },
   shapeEll: { label: 'Ellipse', icon: '<ellipse cx="12" cy="12" rx="9" ry="7"/>' },
   shapeTri: { label: 'Triangle', icon: '<path d="M12 4l9 16H3z"/>' },
@@ -1407,7 +1411,7 @@ const GROUPS = [
   { key: 'S', ids: ['clone', 'patstamp'] },
   { key: 'Y', ids: ['histbrush', 'arthist'] },
   { key: 'E', ids: ['eraser', 'bgeraser', 'mageraser'] },
-  { key: 'G', ids: ['grad', 'fill'] },
+  { key: 'G', ids: ['grad', 'fill', 'bucketRep'] },
   { key: 'R', ids: ['blur', 'sharpen', 'smudge'] },
   { key: 'O', ids: ['dodge', 'burn', 'sponge'] },
   { key: 'P', ids: ['pen', 'freepen', 'curvpen', 'addAnchor', 'delAnchor', 'convAnchor'] },
@@ -1560,6 +1564,14 @@ function syncOptions() {
     rows.push(colorRow('optColor', 'Color', opt.color));
     rows.push(range('optTol', 'Tolerance', 0, 200, opt.tolerance, '', 1, 0, 255));
     rows.push(check('optContig', opt.contiguous ? 'Contiguous' : 'Global'));
+  } else if (tool === 'bucketRep') {
+    rows.push(colorRow('optColor', 'New colour', opt.color));
+    rows.push(range('optTol', 'Tolerance', 0, 200, opt.tolerance, '', 1, 0, 255));
+    rows.push(sel('optRepMatch', 'Match', [['shades', 'Shades of it'], ['exact', 'Exact colour']], opt.repMatch));
+    rows.push(check('optRepShade', opt.repShade ? 'Keep shading' : 'Flat colour'));
+    rows.push(check('optContig', opt.contiguous ? 'Contiguous' : 'Whole texture'));
+    rows.push(sel('optRepScope', 'Scope', [['layer', 'This layer'], ['all', 'All layers']], opt.repScope));
+    rows.push(note('Pick the new colour, then click the colour you want gone. Alt+click samples a colour instead.'));
   } else if (tool === 'grad') {
     rows.push(colorRow('optColor', 'From', opt.color));
     rows.push(sel('optGradType', 'Type', [['linear', 'Linear'], ['radial', 'Radial']], opt.gradType));
@@ -1719,8 +1731,8 @@ function syncOptions() {
     rows.push(check('optSymY', 'Mirror Y'));
   }
   if (l) rows.push('<button class="chip-btn" id="btnAdjust" title="Hue / saturation / brightness / contrast for the active layer">Adjust</button>');
-  rows.push(`<button class="chip-btn ${uvVisible ? 'on' : ''}" id="btnUV" title="Overlay the model's UV wireframe on the texture">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 12h18M12 3v21M3 3l18 18"/></svg>UV map</button>`);
+  rows.push(`<button class="chip-btn ${uvVisible ? 'on' : ''}" id="btnUV" title="Click to cycle: off · only the parts using this texture · every part of the model">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 12h18M12 3v21M3 3l18 18"/></svg>UV map${uvVisible ? (uvMode === 2 ? ' · all' : ' · this') : ''}</button>`);
   rows.push('<button class="chip-btn" id="btnFit" title="Fit texture in view (F)">Fit</button>');
   bar.innerHTML = rows.join('');
   const symX = $('#optSymX'), symY = $('#optSymY');
@@ -1805,14 +1817,25 @@ function syncOptions() {
   bind('btnRulerClear', () => { rulerLine = null; $('#stMeasure').textContent = '—'; syncOptions(); needDraw = true; }, 'click');
   bind('btnAdjust', openAdjust, 'click');
   bind('btnUV', () => {
-    uvVisible = !uvVisible;
+    if (!uvVisible) { uvVisible = true; uvMode = 1; }
+    else if (uvMode === 1) { uvMode = 2; }
+    else { uvVisible = false; uvMode = 1; }
     if (uvVisible && !modelLoaded) toast('Import a model first — the UV overlay comes from the model.', 'info');
+    else if (uvVisible) {
+      const total = rawModelGeos ? rawModelGeos.filter(g => g.uvs).length : 0;
+      toast(uvMode === 2 ? 'Showing UVs for all ' + total + ' parts of the model.'
+                         : 'Showing only the parts that use this texture.', 'info', 2600);
+    }
+    refreshUVOverlay();
     syncOptions(); needDraw = true;
   }, 'click');
   bindPair('optWet', v => { opt.wet = v / 100; });
   bindPair('optCorner', v => { opt.corner = v; });
   bindPair('optStar', v => { opt.starRatio = v / 100; });
   bind('optCustom', e => { opt.custom = e.target.value; });
+  bind('optRepMatch', e => { opt.repMatch = e.target.value; });
+  bind('optRepScope', e => { opt.repScope = e.target.value; });
+  bind('optRepShade', () => { opt.repShade = !opt.repShade; syncOptions(); }, 'click');
   bind('optArrow', () => { opt.arrow = !opt.arrow; syncOptions(); }, 'click');
   bindPair('optShapeStrokeW', v => { opt.shapeStrokeW = v; });
   bindPair('optRotView', v => { view.rot = v; needDraw = true; });
@@ -2195,7 +2218,7 @@ function pixelLine(l, x0, y0, x1, y1) {
   const steps = Math.max(1, Math.ceil(d / spacing));
   for (let i = 1; i <= steps; i++) {
     const nx = lerp(x0, x1, i / steps), ny = lerp(y0, y1, i / steps);
-    if (tool === 'smudge') sampleSmudge(l, x0, y0);
+    if (tool === 'smudge' || tool === 'mixer') sampleSmudge(l, x0, y0);
     pixelStamp(l, nx, ny);
   }
 }
@@ -2229,6 +2252,158 @@ function quickSelStamp(x, y, subtract) {
 }
 
 /* ---------------- fill / picker / text ---------------- */
+
+/* =====================================================================
+   REPLACE COLOUR — one click swaps a colour everywhere on the texture
+   ===================================================================== */
+function rgbToHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+  const l = (mx + mn) / 2;
+  let h = 0, s = 0;
+  const d = mx - mn;
+  if (d > 1e-6) {
+    s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+    if (mx === r) h = ((g - b) / d + (g < b ? 6 : 0));
+    else if (mx === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60;
+  }
+  return { h, s, l };
+}
+
+function hslToRgb(h, s, l) {
+  h = ((h % 360) + 360) % 360;
+  if (s <= 1e-6) { const v = Math.round(l * 255); return [v, v, v]; }
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c / 2;
+  let rr = 0, gg = 0, bb = 0;
+  if (h < 60) { rr = c; gg = x; }
+  else if (h < 120) { rr = x; gg = c; }
+  else if (h < 180) { gg = c; bb = x; }
+  else if (h < 240) { gg = x; bb = c; }
+  else if (h < 300) { rr = x; bb = c; }
+  else { rr = c; bb = x; }
+  return [Math.round((rr + m) * 255), Math.round((gg + m) * 255), Math.round((bb + m) * 255)];
+}
+
+// Does this pixel count as "the colour we clicked"?
+function repMatches(pr, pg, pb, target, mode, tol) {
+  if (mode === 'exact') {
+    return Math.max(Math.abs(pr - target.r), Math.abs(pg - target.g), Math.abs(pb - target.b)) <= tol;
+  }
+  // 'shades': match by hue so shadows and highlights of the same paint come too
+  const p = rgbToHsl(pr, pg, pb);
+  const t = target.hsl;
+  const satTol = clamp(tol / 200, 0, 1) * 0.75 + 0.18;
+  if (t.s < 0.12) {
+    // clicked something neutral — match other neutrals of any brightness
+    return p.s < Math.max(0.14, satTol * 0.5);
+  }
+  if (p.s < 0.05) return false;              // leave pure white / black / grey alone
+  let dh = Math.abs(p.h - t.h);
+  if (dh > 180) dh = 360 - dh;
+  if (dh > clamp(tol * 0.55, 4, 90)) return false;
+  return Math.abs(p.s - t.s) <= satTol;
+}
+
+// Re-colour one pixel, optionally carrying its shading across.
+function repShift(pr, pg, pb, target, dest, preserve) {
+  if (!preserve) return [dest.r, dest.g, dest.b];
+  const p = rgbToHsl(pr, pg, pb), t = target.hsl, d = dest.hsl;
+  const s = t.s > 0.02 ? clamp(d.s * (p.s / t.s), 0, 1) : d.s;
+  const l = clamp(d.l + (p.l - t.l), 0, 1);
+  return hslToRgb(d.h, s, l);
+}
+
+function replaceColorAt(txf, tyf) {
+  const x = Math.floor(txf), y = Math.floor(tyf);
+  if (x < 0 || y < 0 || x >= TW || y >= TH) return;
+
+  compositeAll();
+  const seen = compCtx.getImageData(0, 0, TW, TH);
+  const sd = seen.data;
+  const si = (y * TW + x) * 4;
+  if (sd[si + 3] < 8) { toast('That spot is transparent — nothing to replace.', 'info', 3000); return; }
+
+  const target = { r: sd[si], g: sd[si + 1], b: sd[si + 2] };
+  target.hsl = rgbToHsl(target.r, target.g, target.b);
+  const [dr, dg, db] = hexToRGB(opt.color);
+  const dest = { r: dr, g: dg, b: db, hsl: rgbToHsl(dr, dg, db) };
+  const mode = opt.repMatch, tol = opt.tolerance, preserve = opt.repShade;
+
+  // which pixels count, judged on the flattened image the user can see
+  const mask = new Uint8Array(TW * TH);
+  if (opt.contiguous) {
+    const stack = new Int32Array(TW * TH);
+    const visited = new Uint8Array(TW * TH);
+    let sp = 0;
+    stack[sp++] = y * TW + x;
+    visited[y * TW + x] = 1;
+    while (sp > 0) {
+      const pIdx = stack[--sp];
+      const pi = pIdx * 4;
+      if (sd[pi + 3] < 8 || !repMatches(sd[pi], sd[pi + 1], sd[pi + 2], target, mode, tol)) continue;
+      mask[pIdx] = 1;
+      const px2 = pIdx % TW, py2 = (pIdx / TW) | 0;
+      if (px2 > 0 && !visited[pIdx - 1]) { visited[pIdx - 1] = 1; stack[sp++] = pIdx - 1; }
+      if (px2 < TW - 1 && !visited[pIdx + 1]) { visited[pIdx + 1] = 1; stack[sp++] = pIdx + 1; }
+      if (py2 > 0 && !visited[pIdx - TW]) { visited[pIdx - TW] = 1; stack[sp++] = pIdx - TW; }
+      if (py2 < TH - 1 && !visited[pIdx + TW]) { visited[pIdx + TW] = 1; stack[sp++] = pIdx + TW; }
+    }
+  } else {
+    for (let p2 = 0; p2 < mask.length; p2++) {
+      const pi = p2 * 4;
+      if (sd[pi + 3] < 8) continue;
+      if (repMatches(sd[pi], sd[pi + 1], sd[pi + 2], target, mode, tol)) mask[p2] = 1;
+    }
+  }
+  if (selAlpha) for (let p2 = 0; p2 < mask.length; p2++) if (selAlpha[p2] < 128) mask[p2] = 0;
+
+  let hits = 0;
+  for (let p2 = 0; p2 < mask.length; p2++) if (mask[p2]) hits++;
+  if (!hits) {
+    toast('Nothing matched that colour — raise Tolerance, or switch Match to Shades.', 'info', 4500);
+    return;
+  }
+
+  const targets = opt.repScope === 'all'
+    ? layers.filter(l => l.type === 'raster' && l.visible)
+    : [activeLayer()].filter(Boolean);
+  if (!targets.length) { toast('No layer to work on.', 'err'); return; }
+
+  pushUndo(targets.length === 1 ? targets[0] : null);
+  if (targets.length === 1) rasterizeIfNeeded(targets[0]);
+
+  let touched = 0;
+  for (const l of targets) {
+    if (l.type !== 'raster') continue;
+    const lc = ctx2d(l.canvas);
+    const li = lc.getImageData(0, 0, TW, TH);
+    const ld = li.data;
+    let any = false;
+    for (let p2 = 0; p2 < mask.length; p2++) {
+      if (!mask[p2]) continue;
+      const pi = p2 * 4;
+      if (ld[pi + 3] < 8) continue;          // this layer is empty here
+      const out = repShift(ld[pi], ld[pi + 1], ld[pi + 2], target, dest, preserve);
+      ld[pi] = out[0]; ld[pi + 1] = out[1]; ld[pi + 2] = out[2];
+      any = true;
+      touched++;
+    }
+    if (any) lc.putImageData(li, 0, 0);
+  }
+  invalidate();
+
+  const hex = '#' + [target.r, target.g, target.b].map(v => v.toString(16).padStart(2, '0')).join('');
+  if (!touched) {
+    toast('That colour is on a different layer — switch Scope to "All layers" or pick the right layer.', 'info', 5000);
+  } else {
+    toast('Replaced ' + hex + ' with ' + opt.color + ' — ' + touched.toLocaleString() + ' pixels.', 'ok', 3600);
+  }
+}
+
 function floodFill(txf, tyf) {
   const l = activeLayer();
   if (!l) { toast('Add a layer first.', 'err'); return; }
@@ -2729,13 +2904,13 @@ viewEl.addEventListener('pointerdown', e => {
     rasterizeIfNeeded(l);
     strokeActive = true;
     smudgeColor = null;
-    if (tool === 'colorrep') {
+    if (tool === 'colorrep' || tool === 'bgeraser') {
       compositeAll();
       const p = compCtx.getImageData(clamp(Math.floor(tx), 0, TW - 1), clamp(Math.floor(ty), 0, TH - 1), 1, 1).data;
       replaceTarget = [p[0], p[1], p[2]];
     }
     if (PIXEL_TOOLS.has(tool)) {
-      if (tool === 'smudge') sampleSmudge(l, tx, ty);
+      if (tool === 'smudge' || tool === 'mixer') sampleSmudge(l, tx, ty);
       if (e.shiftKey && lastStrokeEnd) pixelLine(l, lastStrokeEnd.x, lastStrokeEnd.y, tx, ty);
       else pixelStamp(l, tx, ty);
     } else {
@@ -2756,6 +2931,9 @@ viewEl.addEventListener('pointerdown', e => {
   if (tool === 'fill') {
     if (e.altKey) { pickColor(tx, ty, true); return; }
     floodFill(tx, ty);
+  } else if (tool === 'bucketRep') {
+    if (e.altKey) { pickColor(tx, ty, true); return; }
+    replaceColorAt(tx, ty);
   } else if (tool === 'picker') {
     pickColor(tx, ty);
   } else if (TEXT_TOOLS.has(tool)) {
@@ -3617,7 +3795,7 @@ function refreshUVOverlay() {
     return;
   }
   let geos = rawModelGeos.filter(g => g.uvs);
-  if (rawModelMulti && curDoc >= 0 && docs[curDoc]) {
+  if (uvMode === 1 && rawModelMulti && curDoc >= 0 && docs[curDoc]) {
     const key = normTex(docs[curDoc].baseName || '');
     const filt = geos.filter(g => (g.texNames || []).some(n => normTex(n) === key));
     if (filt.length) geos = filt; // show only the panels this texture actually covers
@@ -4211,6 +4389,125 @@ function parseDrawableGeometries(rsc, drawOff) {
   return geos;
 }
 
+
+/* ---------------------------------------------------------------------
+   Vertex layout decoding.
+   GTA V vertex buffers describe each component with a 4-bit type code in
+   the declaration's Types field, so component sizes are NOT fixed: normals
+   may be Dec3N (4 bytes), texcoords Half2 (4) or Float2 (8), tangents
+   Half4 (8) or Float4 (16). Guessing fixed sizes puts the texcoord read at
+   the wrong offset and produces UVs that look plausible but are wrong.
+
+   Rather than trust any single table, we generate candidate texcoord
+   layouts and score the UVs they produce, keeping the most sensible one.
+   ------------------------------------------------------------------ */
+const VC_SIZE = { 0: 0, 1: 4, 2: 4, 3: 8, 4: 16, 5: 4, 6: 4, 7: 4, 8: 8, 9: 12, 10: 16, 11: 4, 12: 4, 13: 4, 14: 8, 15: 2 };
+
+// Score how much a decoded UV set looks like real texture coordinates.
+function scoreUVs(uv) {
+  const n = uv.length / 2;
+  if (!n) return -1;
+  let inRange = 0, finite = 0;
+  let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+  const step = Math.max(1, Math.floor(n / 400));   // sample for speed
+  let sampled = 0;
+  for (let i = 0; i < n; i += step) {
+    const u = uv[i * 2], v = uv[i * 2 + 1];
+    sampled++;
+    if (!isFinite(u) || !isFinite(v)) continue;
+    finite++;
+    if (u > -0.6 && u < 1.6 && v > -0.6 && v < 1.6) inRange++;
+    if (u < minU) minU = u; if (u > maxU) maxU = u;
+    if (v < minV) minV = v; if (v > maxV) maxV = v;
+  }
+  if (!sampled || finite < sampled * 0.98) return -1;
+  const w = maxU - minU, h = maxV - minV;
+  if (!isFinite(w) || !isFinite(h)) return -1;
+  if (w < 1e-4 && h < 1e-4) return -1;            // every vertex identical
+  if (w > 64 || h > 64) return -1;                // wildly out of range
+  let score = inRange / sampled;                   // main signal
+  const span = Math.min(1, Math.max(w, h));        // real UV islands cover ground
+  score += span * 0.35;
+  if (w > 8 || h > 8) score -= 0.5;
+  // A misaligned read usually straddles two components, leaving one axis
+  // almost constant. Genuine UV islands vary in both directions.
+  const big = Math.max(w, h), small = Math.min(w, h);
+  if (big > 1e-3 && small < big * 0.02) score -= 0.6;
+  return score;
+}
+
+function decodeUVAt(dv, base, stride, vCount, off, half) {
+  const uv = new Float32Array(vCount * 2);
+  const end = half ? off + 4 : off + 8;
+  if (off < 0 || end > stride) return null;
+  for (let i = 0; i < vCount; i++) {
+    const o = base + i * stride + off;
+    let u, v;
+    if (half) { u = halfToFloat(dv.getUint16(o, true)); v = halfToFloat(dv.getUint16(o + 2, true)); }
+    else { u = dv.getFloat32(o, true); v = dv.getFloat32(o + 4, true); }
+    uv[i * 2] = u; uv[i * 2 + 1] = v;
+  }
+  return uv;
+}
+
+// Work out where texcoord0 lives, using the declaration as a hint but
+// verifying against the data itself.
+function findTexcoords(dv, base, stride, vCount, flags, types) {
+  const candidates = [];
+  const addDeclCandidates = () => {
+    if (!(flags & (1 << 6))) return;
+    // (a) sizes straight from the Types nibbles
+    if (types !== null) {
+      let off = 0, uvOff = -1, ok = true;
+      for (let bit = 0; bit < 16; bit++) {
+        if (!(flags & (1 << bit))) continue;
+        const t = Number((types >> BigInt(bit * 4)) & 0xFn);
+        const sz = VC_SIZE[t];
+        if (sz === undefined || sz === 0) { ok = false; break; }
+        if (bit === 6) { uvOff = off; }
+        off += sz;
+      }
+      if (ok && uvOff >= 0) {
+        const t6 = Number((types >> BigInt(24)) & 0xFn);
+        const half = VC_SIZE[t6] === 4;
+        if (off === stride) candidates.push({ off: uvOff, half, bonus: 0.6 });
+        else candidates.push({ off: uvOff, half, bonus: 0.15 });
+      }
+    }
+    // (b) legacy fixed-size guesses, both texcoord widths
+    for (const uvSize of [8, 4]) {
+      let off = 0, uvOff = -1;
+      for (let bit = 0; bit < 16; bit++) {
+        if (!(flags & (1 << bit))) continue;
+        if (bit === 6) uvOff = off;
+        off += (bit >= 6 && bit <= 13) ? uvSize : VERT_SIZES[bit];
+      }
+      if (uvOff >= 0) candidates.push({ off: uvOff, half: uvSize === 4, bonus: off === stride ? 0.4 : 0 });
+    }
+  };
+  addDeclCandidates();
+  // (c) exhaustive sweep — the safety net when the declaration is unusual
+  for (let off = 12; off + 4 <= stride; off += 2) {
+    candidates.push({ off, half: true, bonus: 0 });
+    if (off + 8 <= stride) candidates.push({ off, half: false, bonus: 0 });
+  }
+
+  let best = null;
+  const seen = new Set();
+  for (const c of candidates) {
+    const key = c.off + ':' + (c.half ? 'h' : 'f');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const uv = decodeUVAt(dv, base, stride, vCount, c.off, c.half);
+    if (!uv) continue;
+    const s = scoreUVs(uv);
+    if (s < 0) continue;
+    const total = s + (c.bonus || 0) - c.off * 0.0008;   // nudge toward texcoord0
+    if (!best || total > best.total) best = { total, uv, off: c.off, half: c.half };
+  }
+  return best;
+}
+
 function readGeometry(rsc, gOff) {
   const s = rsc.sdv;
   const vbP = rsc.ptr(s, gOff + 0x18);
@@ -4228,48 +4525,38 @@ function readGeometry(rsc, gOff) {
   if (!dataP) return null;
   if (dataP.off + vCount * stride > dataP.arr.byteLength) return null;
 
-  // vertex declaration
+  // vertex declaration: Flags u32 @0x00, Stride u16 @0x04, Count u8 @0x07, Types u64 @0x08
   let flags = 0x49; // pos+normal+uv0 fallback
+  let types = null;
   const infoP = rsc.ptr(s, vb + 0x30);
-  if (infoP) flags = infoP.dv.getUint32(infoP.off, true);
-
-  // component offsets
-  let posOff = -1, uvOff = -1, running = 0;
-  for (let bit = 0; bit < 16; bit++) {
-    if (!(flags & (1 << bit))) continue;
-    if (bit === 0) posOff = running;
-    if (bit === 6 && uvOff < 0) uvOff = running;
-    running += VERT_SIZES[bit];
-  }
-  let uvHalf = false;
-  if (running !== stride) {
-    // try half-precision texcoords (4 bytes instead of 8)
-    let r2 = 0, uv2 = -1;
-    for (let bit = 0; bit < 16; bit++) {
-      if (!(flags & (1 << bit))) continue;
-      if (bit === 6 && uv2 < 0) uv2 = r2;
-      r2 += (bit >= 6 && bit <= 13) ? 4 : VERT_SIZES[bit];
+  if (infoP) {
+    flags = infoP.dv.getUint32(infoP.off, true);
+    if (infoP.off + 16 <= infoP.dv.byteLength) {
+      try {
+        types = infoP.dv.getBigUint64(infoP.off + 8, true);
+      } catch (err) { types = null; }
     }
-    if (r2 === stride) { uvOff = uv2; uvHalf = true; }
-    else if (posOff !== 0) return null; // give up if even position is unclear
   }
-  if (posOff !== 0) posOff = 0; // position is always first in practice
 
   const dv = dataP.dv;
   const base = dataP.off;
+
+  // position is Float3 at offset 0 in every GTA V layout seen in the wild
   const positions = new Float32Array(vCount * 3);
-  const uvs = uvOff >= 0 ? new Float32Array(vCount * 2) : null;
   for (let i = 0; i < vCount; i++) {
     const o = base + i * stride;
     const x = dv.getFloat32(o, true), y = dv.getFloat32(o + 4, true), z = dv.getFloat32(o + 8, true);
     if (!isFinite(x) || !isFinite(y) || !isFinite(z) || Math.abs(x) > 20000 || Math.abs(y) > 20000 || Math.abs(z) > 20000) return null;
     positions[i * 3] = x; positions[i * 3 + 1] = y; positions[i * 3 + 2] = z;
-    if (uvs) {
-      let u, v;
-      if (uvHalf) { u = halfToFloat(dv.getUint16(o + uvOff, true)); v = halfToFloat(dv.getUint16(o + uvOff + 2, true)); }
-      else { u = dv.getFloat32(o + uvOff, true); v = dv.getFloat32(o + uvOff + 4, true); }
-      if (!isFinite(u) || !isFinite(v) || Math.abs(u) > 512 || Math.abs(v) > 512) { u = 0; v = 0; }
-      uvs[i * 2] = u; uvs[i * 2 + 1] = 1 - v; // GTA v measures from the top; three flips
+  }
+
+  const found = findTexcoords(dv, base, stride, vCount, flags, types);
+  let uvs = null;
+  if (found) {
+    uvs = new Float32Array(vCount * 2);
+    for (let i = 0; i < vCount; i++) {
+      uvs[i * 2] = found.uv[i * 2];
+      uvs[i * 2 + 1] = 1 - found.uv[i * 2 + 1];   // GTA measures v from the top
     }
   }
 
@@ -4287,7 +4574,7 @@ function readGeometry(rsc, gOff) {
     if (v >= vCount) return null;
     indices[i] = v;
   }
-  return { positions, uvs, indices };
+  return { positions, uvs, indices, vbOff: dataP.off };
 }
 
 function looksLikeDrawable(rsc, off) {
@@ -4795,6 +5082,7 @@ function saveCur() {
   d.undo = undoStack.slice(); d.redo = redoStack.slice();
   d.hasBaseTexture = hasBaseTexture; d.baseName = baseName;
   d.label = $('#stTexName').textContent;
+  if (!d.origName && d.baseName) d.origName = d.baseName;
 }
 
 function activateDoc(i, force) {
@@ -4827,7 +5115,8 @@ function makeDocFromRGBA(width, height, rgba, name) {
   return {
     tw: width, th: height, layers: [l], activeIdx: 0,
     undo: [], redo: [], hasBaseTexture: true,
-    baseName: name.replace(/\.[^.]+$/, ''), label: name
+    baseName: name.replace(/\.[^.]+$/, ''), label: name,
+    origName: name.replace(/\.[^.]+$/, '')
   };
 }
 
@@ -4956,7 +5245,7 @@ function saveProject() {
     toast('Project saved.', 'ok', 3000);
   };
   docs.forEach((d, di) => {
-    const entry = { tw: d.tw, th: d.th, baseName: d.baseName, label: d.label, layers: [] };
+    const entry = { tw: d.tw, th: d.th, baseName: d.baseName, label: d.label, origName: d.origName, layers: [] };
     doc[di] = entry;
     d.layers.forEach((l, li) => {
       pending++;
@@ -4998,7 +5287,7 @@ async function loadProject(file) {
       }
       newDocs.push({
         tw: d.tw, th: d.th, layers: layersOut, activeIdx: layersOut.length - 1,
-        undo: [], redo: [], hasBaseTexture: true, baseName: d.baseName, label: d.label
+        undo: [], redo: [], hasBaseTexture: true, baseName: d.baseName, label: d.label, origName: d.origName
       });
     }
     if (!newDocs.length) throw new Error('That project has no textures in it.');
@@ -5234,77 +5523,143 @@ function flagsForSize(size) {
   return null;
 }
 
-function writeYTD(texs) {
-  // texs: [{name, imgData}]
+function buildMipChain(imgData, want) {
+  const levels = [imgData];
+  if (!want) return levels;
+  let cur = imgData;
+  while (cur.width > 1 || cur.height > 1) {
+    const nw = Math.max(1, cur.width >> 1), nh = Math.max(1, cur.height >> 1);
+    const src = makeCanvas(cur.width, cur.height);
+    src.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(cur.data), cur.width, cur.height), 0, 0);
+    const dst = makeCanvas(nw, nh);
+    const dc = dst.getContext('2d');
+    dc.imageSmoothingEnabled = true;
+    dc.imageSmoothingQuality = 'high';
+    dc.drawImage(src, 0, 0, nw, nh);
+    cur = dc.getImageData(0, 0, nw, nh);
+    levels.push(cur);
+    if (levels.length > 14) break;
+  }
+  return levels;
+}
+
+// pack one mip level into the chosen GPU format
+function packLevel(level, fmt) {
+  if (fmt === 'a8r8g8b8') {
+    const out = new Uint8Array(level.width * level.height * 4);
+    const s = level.data;
+    for (let i = 0; i < level.width * level.height; i++) {
+      out[i * 4] = s[i * 4 + 2];      // B
+      out[i * 4 + 1] = s[i * 4 + 1];  // G
+      out[i * 4 + 2] = s[i * 4];      // R
+      out[i * 4 + 3] = s[i * 4 + 3];  // A
+    }
+    return out;
+  }
+  return encodeDXT(level, fmt);
+}
+
+function fmtCode(fmt) {
+  return fmt === 'dxt1' ? FCC_DXT1 : fmt === 'dxt5' ? FCC_DXT5 : 21;
+}
+
+function levelStride(w, fmt) {
+  if (fmt === 'a8r8g8b8') return w * 4;
+  return Math.max(1, Math.ceil(w / 4)) * (fmt === 'dxt1' ? 8 : 16);
+}
+
+/* Build a RAGE texture dictionary (.ytd).
+   opts: { format: 'auto'|'dxt1'|'dxt5'|'a8r8g8b8', mips: bool } */
+function writeYTD(texs, opts) {
   if (typeof pako === 'undefined') throw new Error('The compression library is missing — reload with an internet connection to write YTD files.');
+  opts = Object.assign({ format: 'auto', mips: true }, opts || {});
   const enc = new TextEncoder();
   const n = texs.length;
+  if (!n) throw new Error('There are no textures to write.');
   const align = (v, a) => (v + (a - 1)) & ~(a - 1);
-  const PTR = (seg, off) => (seg << 28 | off) >>> 0;
+  const PTR = (seg, off) => ((seg << 28) | off) >>> 0;
+
+  // ---- encode the pixel data first: we need its size for the layout ----
+  const blobs = texs.map(t => {
+    const fmt = opts.format === 'auto'
+      ? (hasTransparency(t.imgData) ? 'dxt5' : 'dxt1')
+      : opts.format;
+    const chain = buildMipChain(t.imgData, opts.mips);
+    const parts = chain.map(lv => packLevel(lv, fmt));
+    let total = 0;
+    for (const p of parts) total += p.length;
+    const data = new Uint8Array(total);
+    let o = 0;
+    for (const p of parts) { data.set(p, o); o += p.length; }
+    return { fmt, data, levels: chain.length, w: t.imgData.width, h: t.imgData.height };
+  });
 
   // ---- system segment layout ----
-  const DICT = 0x00, DICT_LEN = 0x40;
-  const TEX_LEN = 0x90;
+  const DICT_LEN = 0x40;
+  const TEX_LEN = 0x80;            // sizeof(grcTexturePC)
   let p = align(DICT_LEN, 16);
   const hashOff = p; p = align(p + n * 4, 16);
   const listOff = p; p = align(p + n * 8, 16);
   const texOff = [];
   for (let i = 0; i < n; i++) { texOff.push(p); p = align(p + TEX_LEN, 16); }
+  const encoded = texs.map(t => enc.encode(String(t.name).replace(/\.[^.]+$/, '').slice(0, 120)));
   const nameOff = [];
-  const encoded = texs.map(t => enc.encode(t.name.replace(/\.[^.]+$/, '')));
   for (let i = 0; i < n; i++) { nameOff.push(p); p = align(p + encoded[i].length + 1, 4); }
-  const sysSize = align(p, 16);
+  const sysUsed = align(p, 16);
 
-  // ---- graphics segment: the pixel data ----
-  const blobs = texs.map(t => {
-    const fmt = hasTransparency(t.imgData) ? 'dxt5' : 'dxt1';
-    return { fmt, data: encodeDXT(t.imgData, fmt), w: t.imgData.width, h: t.imgData.height };
-  });
+  // ---- graphics segment layout ----
   const dataOff = [];
   let g = 0;
   for (const b of blobs) { g = align(g, 16); dataOff.push(g); g += b.data.length; }
-  const gfxSize = align(g, 16);
+  const gfxUsed = align(g, 16);
+
+  // ---- page flags, then pad each segment out to the size the flags declare ----
+  const sysFlags = flagsForSize(sysUsed), gfxFlags = flagsForSize(gfxUsed);
+  if (sysFlags === null || gfxFlags === null) {
+    throw new Error('These textures are too large for the YTD writer — export them as DDS files instead.');
+  }
+  // CRITICAL: the game (and any reader) splits the decompressed buffer using the
+  // sizes encoded in the flags, not the packed sizes. The segments must be padded
+  // to exactly those sizes or every pixel pointer lands in the wrong place.
+  const sysSize = rscSizeFromFlags(sysFlags);
+  const gfxSize = rscSizeFromFlags(gfxFlags);
 
   const sys = new Uint8Array(sysSize);
   const sv = new DataView(sys.buffer);
-  // pgDictionary<grcTexture>
-  sv.setUint32(0x08, 1, true);                       // unknown / usage
-  sv.setUint32(0x18, 1, true);                       // usage count
-  sv.setUint32(0x20, PTR(5, hashOff), true);         // hashes pointer
-  sv.setUint16(0x28, n, true);                       // hash count
-  sv.setUint16(0x2A, n, true);                       // hash capacity
-  sv.setUint32(0x30, PTR(5, listOff), true);         // texture pointer list
+  sv.setUint32(0x18, 1, true);                       // UsageCount
+  sv.setUint32(0x20, PTR(5, hashOff), true);         // name hashes
+  sv.setUint16(0x28, n, true);
+  sv.setUint16(0x2A, n, true);
+  sv.setUint32(0x30, PTR(5, listOff), true);         // texture pointers
   sv.setUint16(0x38, n, true);
   sv.setUint16(0x3A, n, true);
 
-  const sorted = texs.map((t, i) => ({ i, hash: jenkinsHash(t.name.replace(/\.[^.]+$/, '')) }))
-    .sort((a, b) => a.hash - b.hash);   // the dictionary expects ascending hashes
-  sorted.forEach((s, k) => {
+  // dictionary entries must be sorted by name hash, with both arrays in step
+  const cleanNames = texs.map(t => String(t.name).replace(/\.[^.]+$/, ''));
+  const order = texs.map((t, i) => ({ i, hash: jenkinsHash(cleanNames[i]) }))
+    .sort((a, b) => (a.hash >>> 0) - (b.hash >>> 0));
+  order.forEach((s, k) => {
     sv.setUint32(hashOff + k * 4, s.hash, true);
     sv.setUint32(listOff + k * 8, PTR(5, texOff[s.i]), true);
   });
 
   blobs.forEach((b, i) => {
     const o = texOff[i];
-    sv.setUint32(o + 0x08, 1, true);
-    sv.setUint32(o + 0x28, PTR(5, nameOff[i]), true);      // name
-    sv.setUint32(o + 0x40, 6, true);                        // usage: DIFFUSE
+    sv.setUint32(o + 0x28, PTR(5, nameOff[i]), true);   // name pointer
+    sys[o + 0x40] = 6;                                   // usage: DIFFUSE
     sv.setUint16(o + 0x50, b.w, true);
     sv.setUint16(o + 0x52, b.h, true);
-    sv.setUint16(o + 0x54, 1, true);                        // depth
-    sv.setUint16(o + 0x56, Math.max(1, Math.ceil(b.w / 4) * (b.fmt === 'dxt1' ? 8 : 16)), true); // stride
-    sv.setUint32(o + 0x58, b.fmt === 'dxt1' ? FCC_DXT1 : FCC_DXT5, true);
+    sv.setUint16(o + 0x54, 1, true);                     // depth
+    sv.setUint16(o + 0x56, levelStride(b.w, b.fmt), true);
+    sv.setUint32(o + 0x58, fmtCode(b.fmt), true);
     sys[o + 0x5C] = 0;
-    sys[o + 0x5D] = 1;                                      // mip levels
-    sv.setUint32(o + 0x70, PTR(6, dataOff[i]), true);       // pixel data
+    sys[o + 0x5D] = b.levels;                            // mip count
+    sv.setUint32(o + 0x70, PTR(6, dataOff[i]), true);    // pixel data
     sys.set(encoded[i], nameOff[i]);
   });
 
   const gfx = new Uint8Array(gfxSize);
   blobs.forEach((b, i) => gfx.set(b.data, dataOff[i]));
-
-  const sysFlags = flagsForSize(sysSize), gfxFlags = flagsForSize(gfxSize);
-  if (sysFlags === null || gfxFlags === null) throw new Error('These textures are too large for the YTD writer — export DDS files instead.');
 
   const raw = new Uint8Array(sysSize + gfxSize);
   raw.set(sys, 0);
@@ -5314,26 +5669,96 @@ function writeYTD(texs) {
   const out = new Uint8Array(16 + deflated.length);
   const ov = new DataView(out.buffer);
   ov.setUint32(0, 0x37435352, true);   // 'RSC7'
-  ov.setUint32(4, 13, true);           // YTD resource version
+  ov.setUint32(4, 13, true);           // texture dictionary version
   ov.setUint32(8, sysFlags, true);
   ov.setUint32(12, gfxFlags, true);
   out.set(deflated, 16);
-  return new Blob([out], { type: 'application/octet-stream' });
+  return { bytes: out, blobs, sysSize, gfxSize };
 }
 
-function exportYTD() {
+/* Read the file we just produced back through our own parser and confirm every
+   texture is where it should be. Cheap, and it catches layout mistakes before
+   the file ever reaches the game. */
+function verifyYTD(bytes, expected) {
+  const rsc = parseRSC7(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  const found = scanTextures(rsc);
+  const problems = [];
+  if (found.length !== expected.length) {
+    problems.push('found ' + found.length + ' of ' + expected.length + ' textures');
+  }
+  for (const e of expected) {
+    const m = found.find(f => f.name.toLowerCase() === e.name.toLowerCase());
+    if (!m) { problems.push('missing "' + e.name + '"'); continue; }
+    if (m.w !== e.w || m.h !== e.h) {
+      problems.push(e.name + ' is ' + m.w + '×' + m.h + ', expected ' + e.w + '×' + e.h);
+      continue;
+    }
+    try {
+      const dec = decodeGTATexture(rsc, m);
+      if (dec.width !== e.w || dec.height !== e.h) problems.push(e.name + ' decoded at the wrong size');
+    } catch (err) {
+      problems.push(e.name + ' could not be decoded back (' + err.message + ')');
+    }
+  }
+  return problems;
+}
+
+function ytdSourceName(d, i) {
+  // prefer the texture's original in-game name so it drops back into the model cleanly
+  return String(d.origName || d.baseName || ('texture_' + (i + 1))).replace(/\.[^.]+$/, '');
+}
+
+function doExportYTD(format, mips) {
   saveCur();
   try {
     const texs = docs.map((d, i) => {
       const c = compositeDoc(d);
-      return { name: (d.baseName || ('texture_' + (i + 1))), imgData: c.getContext('2d').getImageData(0, 0, d.tw, d.th) };
+      return { name: ytdSourceName(d, i), imgData: c.getContext('2d').getImageData(0, 0, d.tw, d.th) };
     });
-    const blob = writeYTD(texs);
-    download(blob, (baseName || 'textures') + '.ytd');
-    toast('Wrote ' + texs.length + ' texture' + (texs.length > 1 ? 's' : '') + ' into a .ytd — test it in OpenIV before using it in game.', 'ok', 7000);
+    const oversize = texs.filter(t => (t.imgData.width & (t.imgData.width - 1)) || (t.imgData.height & (t.imgData.height - 1)));
+    const res = writeYTD(texs, { format, mips });
+    const problems = verifyYTD(res.bytes, texs.map((t, i) => ({ name: t.name, w: t.imgData.width, h: t.imgData.height })));
+    download(new Blob([res.bytes], { type: 'application/octet-stream' }), (baseName || 'textures') + '.ytd');
+    const kinds = {};
+    res.blobs.forEach(b => { kinds[b.fmt] = (kinds[b.fmt] || 0) + 1; });
+    const kindTxt = Object.entries(kinds).map(([k, v]) => v + '×' + k.toUpperCase()).join(', ');
+    if (problems.length) {
+      toast('Wrote the .ytd, but the self-check flagged: ' + problems.slice(0, 3).join('; ') + '. Check it in OpenIV before use.', 'err', 12000);
+    } else {
+      toast('Wrote ' + texs.length + ' texture' + (texs.length > 1 ? 's' : '') + ' (' + kindTxt + ') and read it back cleanly. Still worth opening in OpenIV once.', 'ok', 8000);
+    }
+    if (oversize.length) {
+      toast(oversize.length + ' texture' + (oversize.length > 1 ? 's are' : ' is') + ' not a power-of-two size — GTA can refuse those. Resize to 512/1024/2048/4096.', 'err', 10000);
+    }
   } catch (err) {
-    toast(err.message, 'err', 8000);
+    toast(err.message, 'err', 9000);
   }
+}
+
+function exportYTD() {
+  saveCur();
+  const big = docs.some(d => d.tw > 2048 || d.th > 2048);
+  openModal('Export .YTD', `
+    <p>Builds a complete texture dictionary containing all ${docs.length} open texture${docs.length > 1 ? 's' : ''}.</p>
+    <h4>Compression</h4>
+    <div class="menu-grid">
+      <button class="btn" data-f="auto">Auto <kbd>recommended</kbd></button>
+      <button class="btn" data-f="dxt1">DXT1 — no alpha</button>
+      <button class="btn" data-f="dxt5">DXT5 — with alpha</button>
+      <button class="btn" data-f="a8r8g8b8">Uncompressed</button>
+    </div>
+    <p style="margin-top:10px"><b>Auto</b> picks DXT1 for solid textures and DXT5 where there is transparency — the same choice the game ships with.
+    <b>Uncompressed</b> keeps every pixel exact but makes the file about eight times larger${big ? ' (your textures are large, so this may be very big)' : ''}.</p>
+    <label style="display:flex;align-items:center;gap:8px;margin-top:12px;cursor:pointer">
+      <input type="checkbox" id="ytdMips" checked style="width:15px;height:15px;accent-color:var(--amber)">
+      <span>Generate mipmaps (matches real game files — stops distant liveries shimmering)</span>
+    </label>
+    <p class="amber-note" style="margin-top:12px">The writer builds the RAGE resource itself. It self-checks the result by reading it back, but always open the .ytd in OpenIV once before shipping, and keep your original.</p>`);
+  $('#modalBody').querySelectorAll('[data-f]').forEach(b => b.addEventListener('click', () => {
+    const mips = $('#ytdMips') ? $('#ytdMips').checked : true;
+    closeModal();
+    doExportYTD(b.dataset.f, mips);
+  }));
 }
 
 function exportAllZip() {
@@ -5354,6 +5779,60 @@ function exportAllZip() {
       }
     });
   });
+}
+
+
+/* ---------------------------------------------------------------------
+   .YDD — drawable dictionary (EUP / FiveM clothing, ped components)
+   Same pgDictionary layout as a texture dictionary, but the entries are
+   drawables instead of textures.
+   ------------------------------------------------------------------ */
+function parseDrawableDictionaryFile(buf) {
+  const rsc = parseRSC7(buf);
+  const s = rsc.sdv;
+  const geos = [];
+  const seenVB = new Set();
+  let components = 0;
+
+  const takeDrawable = off => {
+    let got;
+    try { got = parseDrawableGeometries(rsc, off); } catch (err) { return false; }
+    if (!got || !got.length) return false;
+    let added = 0;
+    for (const g of got) {
+      if (g.vbOff !== undefined && seenVB.has(g.vbOff)) continue;
+      if (g.vbOff !== undefined) seenVB.add(g.vbOff);
+      geos.push(g);
+      added++;
+    }
+    if (added) components++;
+    return added > 0;
+  };
+
+  // proper dictionary walk: pointer list at 0x30, count at 0x38
+  const listP = rsc.ptr(s, 0x30);
+  const count = s.byteLength > 0x3A ? s.getUint16(0x38, true) : 0;
+  if (listP && listP.seg === 5 && count >= 1 && count <= 1024) {
+    for (let i = 0; i < count; i++) {
+      const dp = rsc.ptr(s, listP.off + i * 8);
+      if (dp && dp.seg === 5) takeDrawable(dp.off);
+    }
+  }
+
+  // fallback for dictionaries whose header does not match the expected layout
+  if (!geos.length) {
+    for (let off = 0; off + 0x70 <= s.byteLength; off += 16) {
+      if (!looksLikeDrawable(rsc, off)) continue;
+      takeDrawable(off);
+      if (geos.length > 4000) break;
+    }
+  }
+
+  if (!geos.length) {
+    throw new Error('No drawable geometry was recognised in this YDD. Open it in OpenIV or CodeWalker and export the component as OBJ instead.');
+  }
+  const textures = scanTextures(rsc);   // some YDDs carry embedded textures
+  return { geos, textures, rsc, components };
 }
 
 /* =====================================================================
@@ -5499,6 +5978,15 @@ async function importModelFile(file) {
         throw new Error('This .gltf references an external .bin file. Export as .glb (single file) instead.');
       }
       geos = parseGLTF(json, bin);
+    } else if (ext === 'ydd') {
+      const res = parseDrawableDictionaryFile(await readFile(file));
+      geos = res.geos;
+      embedded = res.textures;
+      var embeddedRsc = res.rsc;
+      zUp = true;
+      multiTex = true;
+      toast('EUP drawable dictionary — ' + res.components + ' component' + (res.components === 1 ? '' : 's') +
+            ' loaded. Open the matching .ytd to texture ' + (res.components === 1 ? 'it' : 'them') + '.', 'info', 7000);
     } else if (ext === 'yft' || ext === 'ydr') {
       const res = parseDrawableFile(await readFile(file), ext);
       geos = res.geos;
@@ -5765,7 +6253,8 @@ $('#btnHelp').addEventListener('click', () => {
     <h4>1 &middot; Get the files out of the game</h4>
     <ol>
       <li>In <b>OpenIV</b>, export the vehicle's <b>.ytd</b>. Drop it here and every texture inside opens in its own tab.</li>
-      <li>For the model, drop the <b>.yft</b> straight in (experimental &mdash; it also reads which texture each part uses), or export <b>OBJ</b> from <b>CodeWalker</b> for a guaranteed-clean mesh.</li>
+      <li>For a vehicle, drop the <b>.yft</b> straight in (experimental &mdash; it also reads which texture each part uses), or export <b>OBJ</b> from <b>CodeWalker</b> for a guaranteed-clean mesh.</li>
+      <li>For <b>EUP / clothing</b>, drop the <b>.ydd</b> in. A .ydd is a drawable <i>dictionary</i>, so it often holds several components (jacket, vest, badges) &mdash; all of them load together. Its textures still live in a .ydd-matched <b>.ytd</b>, so open that too and each component picks up its own texture by name.</li>
     </ol>
     <h4>2 &middot; Edit</h4>
     <ol>
@@ -5776,16 +6265,21 @@ $('#btnHelp').addEventListener('click', () => {
     <h4>3 &middot; Back into the game</h4>
     <ol>
       <li><b>Export&hellip;</b> &rarr; <i>All textures &mdash; DDS in a ZIP</i> gives correctly named DXT files to drop into the .ytd with OpenIV (Edit mode &rarr; replace).</li>
-      <li><i>All textures &mdash; .YTD</i> builds a complete resource itself. It is <b>experimental</b>: open it in OpenIV to confirm it reads before shipping, and keep the original.</li>
+      <li><i>All textures &mdash; .YTD</i> builds a complete resource itself, with your choice of DXT1 / DXT5 / uncompressed and generated mipmaps. It reads the finished file back to check every texture before handing it over, but still open it in OpenIV once and keep the original.</li>
       <li><b>Save project (.lbproj)</b> keeps every tab, layer, blend mode and path so you can pick the job back up later.</li>
     </ol>
+    <h4>Supported game files</h4>
+    <p><b>.ytd</b> texture dictionaries (read and write) &middot; <b>.yft</b> / <b>.ydr</b> vehicle and prop models &middot;
+    <b>.ydd</b> drawable dictionaries for EUP clothing &middot; <b>.dds</b>, <b>.png</b>, <b>.jpg</b> &middot;
+    <b>.obj</b>, <b>.glb</b>, <b>.gltf</b> from CodeWalker &middot; <b>.lbproj</b> projects.
+    Native RAGE parsing is reverse-engineered, so if a file will not open, the CodeWalker OBJ route always works.</p>
     <h4>Tool stacks &mdash; click and hold, or right-click, any tool for its alternatives</h4>
     <p><kbd>V</kbd> move &middot; <kbd>M</kbd> marquees: rect, ellipse, row, column &middot; <kbd>L</kbd> lassos: free, polygonal, magnetic &middot;
     <kbd>W</kbd> object select, quick select, magic wand &middot; <kbd>C</kbd> crop, perspective crop, slice, slice select &middot;
     <kbd>K</kbd> frame &middot; <kbd>I</kbd> eyedropper, 3D eyedropper, colour sampler, ruler, note, count &middot;
     <kbd>J</kbd> spot heal, heal, patch, content-aware move, red eye &middot; <kbd>B</kbd> brush, pencil, colour replacement, mixer &middot;
     <kbd>S</kbd> clone stamp, pattern stamp &middot; <kbd>Y</kbd> history brush, art history brush &middot;
-    <kbd>E</kbd> eraser, background eraser, magic eraser &middot; <kbd>G</kbd> gradient, paint bucket &middot;
+    <kbd>E</kbd> eraser, background eraser, magic eraser &middot; <kbd>G</kbd> gradient, paint bucket, replace colour &middot;
     <kbd>R</kbd> blur, sharpen, smudge &middot; <kbd>O</kbd> dodge, burn, sponge &middot;
     <kbd>P</kbd> pen, freeform pen, curvature pen, add/delete/convert anchor &middot; <kbd>T</kbd> type, vertical type, type masks &middot;
     <kbd>A</kbd> path select, direct select &middot; <kbd>U</kbd> rectangle, ellipse, triangle, polygon/star, line, custom shapes &middot;
@@ -5796,6 +6290,11 @@ $('#btnHelp').addEventListener('click', () => {
     <kbd>Ctrl</kbd>+<kbd>E</kbd> merge down &middot; <kbd>Ctrl</kbd>+<kbd>J</kbd> duplicate &middot; <kbd>Del</kbd> clear selection &middot;
     <kbd>Enter</kbd> commit a crop or path &middot; <kbd>Esc</kbd> cancel &middot; <kbd>Space</kbd>+drag pan &middot;
     <kbd>Alt</kbd>+click sample or set a source &middot; <kbd>Shift</kbd>+click straight line.</p>
+    <h4>Recolouring a vehicle fast</h4>
+    <p>Pick the <b>Replace colour</b> bucket (<kbd>G</kbd> stack), choose the new colour, then click the colour you want gone &mdash;
+    it swaps that colour across the whole texture in one go. Leave <b>Match</b> on <i>Shades of it</i> so shadows and highlights of the
+    same paint come along, and <b>Keep shading</b> on so the panel shading and dirt survive the change. Switch Match to
+    <i>Exact colour</i> for flat graphics, or tick <b>Contiguous</b> to limit it to the panel you clicked.</p>
     <h4>Layers &amp; selections</h4>
     <p>Every layer has a blend mode and opacity; <b>Adjust</b> shifts hue, saturation, brightness and contrast. The <b>Select</b> menu holds feather,
     grow/shrink, fill, stroke edge and "to new layer". The layer menu (&#9776;) has merge, flatten, flip and clear.</p>
