@@ -434,15 +434,21 @@ const scratchCtx = ctx2d(scratch);
 const uvCanvas = makeCanvas(TW, TH);       // uv wireframe overlay
 let uvVisible = false;   // overlay on/off
 let uvMode = 1;          // 1 = only parts using this texture, 2 = every part
+let uvDense = false;     // false = island outlines (readable), true = full wireframe
 let uvSourceGeos = null;                   // overlay-space uvs (computed)
 const scratch2 = makeCanvas(TW, TH);       // clipping / floating pixels
 let rawModelGeos = null;                   // parsed model geometry (three-space uvs)
 let rawModelMulti = false;                 // true when per-part texture names are known (yft/ydr)
+let rawModelZUp = false;
+let rawModelName = 'model';
 
 let needComposite = true;
 let needDraw = true;
 let wandCache = null;   // cached composite pixels for the magic wand / quick select
-function invalidate() { needComposite = true; needDraw = true; wandCache = null; }
+function invalidate() {
+  needComposite = true; needDraw = true; wandCache = null;
+  if (typeof docs !== 'undefined' && curDoc >= 0 && docs[curDoc]) delete docs[curDoc]._cov;
+}
 
 /* ---------------- layers ---------------- */
 function makeLayer(name, type = 'raster', w = TW, h = TH) {
@@ -456,15 +462,17 @@ function makeLayer(name, type = 'raster', w = TW, h = TH) {
 }
 
 function renderParamLayer(l) {
-  const c = ctx2d(l.canvas), p = l.params;
+  const p = l.params;
+  // A raster layer owns its pixels; clearing it here would erase real work.
+  if (!p || l.type === 'raster') return;
+  const c = ctx2d(l.canvas);
   c.clearRect(0, 0, TW, TH);
-  if (!p) return;
   c.save();
   c.translate(p.x, p.y);
   c.rotate((p.rot || 0) * Math.PI / 180);
   if (l.type === 'decal' && p.img) {
-    const s = p.scale;
-    c.drawImage(p.img, -p.img.width * s / 2, -p.img.height * s / 2, p.img.width * s, p.img.height * s);
+    const sx = p.scale, sy = (p.scaleY === undefined ? p.scale : p.scaleY);
+    c.drawImage(p.img, -p.img.width * sx / 2, -p.img.height * sy / 2, p.img.width * sx, p.img.height * sy);
   } else if (l.type === 'frame') {
     const w = p.w, h = p.h;
     c.beginPath();
@@ -554,6 +562,7 @@ function addLayer(l, at = null) {
 }
 
 function setActive(i) {
+  if (xf && layers[i] !== xf.layer) commitTransform(true);
   activeIdx = clamp(i, -1, layers.length - 1);
   rebuildLayerUI();
   syncOptions();
@@ -574,6 +583,12 @@ function resetProject(w, h, withBase) {
     activeIdx = 0;
   }
   refreshUVOverlay();
+  // the open tab must agree with the project, or exports composite at the old size
+  if (typeof docs !== 'undefined' && curDoc >= 0 && docs[curDoc]) {
+    docs[curDoc].tw = TW; docs[curDoc].th = TH;
+    docs[curDoc].comp = null;
+    delete docs[curDoc]._cov;
+  }
   $('#stSize').textContent = TW + '×' + TH;
   rebuildLayerUI();
   syncOptions();
@@ -588,7 +603,7 @@ const UNDO_CAP = 18;
 function snapState(pixelLayer) {
   return {
     order: layers.slice(),
-    metas: layers.map(l => ({ ref: l, visible: l.visible, opacity: l.opacity, blend: l.blend, name: l.name, params: l.params ? Object.assign({}, l.params) : null })),
+    metas: layers.map(l => ({ ref: l, visible: l.visible, opacity: l.opacity, blend: l.blend, name: l.name, type: l.type, pdx: l.pdx || 0, pdy: l.pdy || 0, params: l.params ? Object.assign({}, l.params) : null })),
     active: activeIdx,
     pixel: pixelLayer ? { ref: pixelLayer, canvas: cloneCanvas(pixelLayer.canvas) } : null
   };
@@ -602,12 +617,40 @@ function applyState(st) {
   layers = st.order.slice();
   st.metas.forEach(m => {
     m.ref.visible = m.visible; m.ref.opacity = m.opacity; m.ref.blend = m.blend || 'source-over'; m.ref.name = m.name;
-    if (m.params) { m.ref.params = Object.assign(m.ref.params || {}, m.params); if (m.ref.type !== 'raster') renderParamLayer(m.ref); }
+    m.ref.pdx = m.pdx || 0; m.ref.pdy = m.pdy || 0;
+    /* Restore the layer KIND alongside its params. Without this, undoing a
+       paint stroke on a decal gave back the params while the layer stayed
+       'raster' — an impossible state where the move tool drove params that
+       nothing rendered, so the layer froze and then vanished. */
+    if (m.type !== undefined) m.ref.type = m.type;
+    m.ref.params = m.params ? Object.assign({}, m.params) : null;
+    if (m.ref.type !== 'raster' && m.ref.params) renderParamLayer(m.ref);
   });
   if (st.pixel) {
-    const c = ctx2d(st.pixel.ref.canvas);
-    c.clearRect(0, 0, st.pixel.ref.canvas.width, st.pixel.ref.canvas.height);
-    c.drawImage(st.pixel.canvas, 0, 0);
+    /* Restore with putImageData rather than drawImage. drawImage is affected by
+       the destination context's transform, clip, alpha and composite mode, so a
+       single unbalanced save/restore anywhere in the app could silently turn an
+       undo into a wipe. putImageData ignores all of that and copies pixels
+       verbatim, which is exactly what restoring a snapshot means. */
+    const dst = st.pixel.ref.canvas;
+    const c = ctx2d(dst);
+    if (st.pixel.canvas.width === dst.width && st.pixel.canvas.height === dst.height) {
+      try {
+        c.putImageData(st.pixel.canvas.getContext('2d').getImageData(0, 0, dst.width, dst.height), 0, 0);
+      } catch (err) {
+        c.save(); c.setTransform(1, 0, 0, 1, 0, 0);
+        c.globalAlpha = 1; c.globalCompositeOperation = 'copy';
+        c.drawImage(st.pixel.canvas, 0, 0);
+        c.restore();
+      }
+    } else {
+      // the canvas was resized after the snapshot (a crop); fit what we have
+      c.save(); c.setTransform(1, 0, 0, 1, 0, 0);
+      c.globalAlpha = 1; c.globalCompositeOperation = 'copy';
+      c.clearRect(0, 0, dst.width, dst.height);
+      c.drawImage(st.pixel.canvas, 0, 0);
+      c.restore();
+    }
   }
   activeIdx = clamp(st.active, -1, layers.length - 1);
   rebuildLayerUI(); syncOptions(); invalidate();
@@ -892,6 +935,40 @@ function drawOverlays() {
         vctx.fillRect(s[0] - 2, s[1] - 2, 4, 4);
       });
     }
+  }
+
+  // free transform box
+  if (xf && tool === 'transform') {
+    const cx = xf.x + xf.w / 2, cy = xf.y + xf.h / 2;
+    vctx.save();
+    const cs = tex2scr(cx, cy);
+    vctx.translate(cs[0], cs[1]);
+    if (view.rot) vctx.rotate(view.rot * Math.PI / 180);
+    if (xf.rot) vctx.rotate(xf.rot * Math.PI / 180);
+    const w = xf.w * view.scale, h = xf.h * view.scale;
+    vctx.strokeStyle = 'rgba(245,165,36,.95)';
+    vctx.lineWidth = 1;
+    vctx.setLineDash([5, 4]);
+    vctx.strokeRect(-w / 2, -h / 2, w, h);
+    vctx.setLineDash([]);
+    // rotate grip
+    vctx.beginPath();
+    vctx.moveTo(0, -h / 2);
+    vctx.lineTo(0, -h / 2 - 26);
+    vctx.stroke();
+    const hs = 4.5;
+    const pts = [[-w/2,-h/2],[0,-h/2],[w/2,-h/2],[w/2,0],[w/2,h/2],[0,h/2],[-w/2,h/2],[-w/2,0]];
+    for (const p of pts) {
+      vctx.fillStyle = '#17181c';
+      vctx.fillRect(p[0] - hs, p[1] - hs, hs * 2, hs * 2);
+      vctx.strokeStyle = '#f5a524';
+      vctx.strokeRect(p[0] - hs, p[1] - hs, hs * 2, hs * 2);
+    }
+    vctx.beginPath();
+    vctx.arc(0, -h / 2 - 26, 4.5, 0, Math.PI * 2);
+    vctx.fillStyle = '#17181c'; vctx.fill();
+    vctx.strokeStyle = '#f5a524'; vctx.stroke();
+    vctx.restore();
   }
 
   // slices
@@ -1379,6 +1456,7 @@ const TOOLDEFS = {
   textV: { label: 'Vertical type', icon: '<path d="M5 4h14M12 4v16M8 8h.01M16 8h.01"/>' },
   typeMask: { label: 'Type mask (text → selection)', icon: '<path stroke-dasharray="3 2" d="M3 4h18v16H3z"/><path d="M8 9V8h8v1M12 8v8"/>' },
   typeMaskV: { label: 'Vertical type mask', icon: '<path stroke-dasharray="3 2" d="M3 4h18v16H3z"/><path d="M9 7h6M12 7v10"/>' },
+  transform: { label: 'Free transform — resize, stretch and rotate (Ctrl+T)', icon: '<path stroke-dasharray="3 2" d="M4 4h16v16H4z"/><rect x="2" y="2" width="4" height="4"/><rect x="18" y="2" width="4" height="4"/><rect x="2" y="18" width="4" height="4"/><rect x="18" y="18" width="4" height="4"/>' },
   bucketRep: { label: 'Replace colour (click a colour to swap it everywhere)', icon: '<path d="M4 12.5 11 5.5a1.5 1.5 0 0 1 2.1 0l4.4 4.4a1.5 1.5 0 0 1 0 2.1l-4.6 4.6a3 3 0 0 1-4.2 0z"/><path d="M9.5 4 8 2.5"/><path d="M19.5 15.5s1.7 2 1.7 3.3a1.7 1.7 0 0 1-3.4 0c0-1.3 1.7-3.3 1.7-3.3z"/><path d="M3 20.5h7"/>' },
   shapeRect: { label: 'Rectangle', icon: '<rect x="3" y="5" width="18" height="14" rx="1"/>' },
   shapeEll: { label: 'Ellipse', icon: '<ellipse cx="12" cy="12" rx="9" ry="7"/>' },
@@ -1399,7 +1477,7 @@ const TOOLDEFS = {
 };
 
 const GROUPS = [
-  { key: 'V', ids: ['move'] },
+  { key: 'V', ids: ['move', 'transform'] },
   { key: 'M', ids: ['marqRect', 'marqEll', 'marqRow', 'marqCol'] },
   { key: 'L', ids: ['lasso', 'polyLasso', 'magLasso'] },
   { key: 'W', ids: ['objSel', 'quickSel', 'wand'] },
@@ -1501,6 +1579,7 @@ function openFlyout(gi, btn) {
 }
 
 function setTool(id) {
+  if (xf && id !== 'transform') commitTransform(true);
   if (tool === 'polyLasso' && id !== 'polyLasso') polyPts = null;
   if (tool === 'crop' && id !== 'crop') cropRect = null;
   tool = id;
@@ -1606,6 +1685,23 @@ function syncOptions() {
     rows.push(colorRow('optStrokeColor', 'Outline color', p ? p.strokeColor : opt.strokeColor));
     rows.push(check('optVertical', (p ? p.vertical : opt.vertical) ? 'Vertical' : 'Horizontal'));
     if (!p) rows.push(note('Click the canvas to place the text as a new layer.'));
+  } else if (tool === 'transform') {
+    if (xf) {
+      const pct = v => Math.round(v * 100);
+      rows.push(numRow('xfW', 'Width', Math.round(Math.abs(xf.w)), 1, 32768));
+      rows.push(numRow('xfH', 'Height', Math.round(Math.abs(xf.h)), 1, 32768));
+      rows.push(numRow('xfPct', 'Scale %', pct(Math.abs(xf.w) / (xf.w0 || 1)), 1, 4000));
+      rows.push(numRow('xfX', 'X', Math.round(xf.x), -32768, 32768));
+      rows.push(numRow('xfY', 'Y', Math.round(xf.y), -32768, 32768));
+      rows.push(range('xfRot', 'Rotate', -180, 180, Math.round(xf.rot), '°', 1, -360, 360));
+      rows.push('<button class="chip-btn ' + (xf.keep ? 'on' : '') + '" id="xfKeep" title="Keep the proportions when dragging a corner (same as holding Shift)">Lock ratio</button>');
+      rows.push('<button class="chip-btn" id="xfFlipH" title="Flip horizontally">Flip H</button>');
+      rows.push('<button class="chip-btn" id="xfFlipV" title="Flip vertically">Flip V</button>');
+      rows.push('<button class="chip-btn" id="xfApply">Apply</button>');
+      rows.push('<button class="chip-btn" id="xfCancel">Cancel</button>');
+    } else {
+      rows.push(note('Click the canvas to put a box around the active layer, then drag the handles. Corners resize, sides stretch one axis, Shift keeps the proportions, Alt works from the centre.'));
+    }
   } else if (tool === 'move') {
     if (selMask) rows.push(note('Drag to move the selected pixels. Deselect (Ctrl+D) to move the whole layer.'));
     if (l && l.params) {
@@ -1733,6 +1829,28 @@ function syncOptions() {
   if (l) rows.push('<button class="chip-btn" id="btnAdjust" title="Hue / saturation / brightness / contrast for the active layer">Adjust</button>');
   rows.push(`<button class="chip-btn ${uvVisible ? 'on' : ''}" id="btnUV" title="Click to cycle: off · only the parts using this texture · every part of the model">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 12h18M12 3v21M3 3l18 18"/></svg>UV map${uvVisible ? (uvMode === 2 ? ' · all' : ' · this') : ''}</button>`);
+  if (uvVisible) {
+    rows.push('<button class="chip-btn ' + (uvDense ? 'on' : '') + '" id="btnUVDense" title="Show every triangle edge instead of just the outline of each UV island">Dense</button>');
+  }
+  if (modelLoaded && rawModelMulti && docs.length) {
+    const shown = activeTexIsVisible();
+    rows.push('<button class="chip-btn ' + (forcedTexDoc ? 'on' : '') + '" id="btnForceTex" title="' +
+      (forcedTexDoc ? 'Stop forcing this texture and go back to what the model asks for'
+                    : 'Paint the texture you are editing onto every body part, even if the model asks for a different one') + '">' +
+      (forcedTexDoc ? 'Unpin texture' : 'Show this on model') + '</button>');
+    if (!shown && !forcedTexDoc) {
+      rows.push(note('This texture is not used by any part of the model — click "Show this on model" to preview it anyway.'));
+    }
+  }
+  if (modelLoaded && rawModelGeos && rawModelGeos.some(g => g._uv)) {
+    const keys = formatsForActiveTexture();
+    let curRank = 0;
+    for (const k of keys) curRank = Math.max(curRank, uvRanks.get(k) || 0);
+    const anyChanged = [...uvRanks.values()].some(v => v > 0);
+    rows.push('<button class="chip-btn ' + (curRank ? 'on' : '') + '" id="btnUVFix" title="Step through the possible vertex layouts — only for the parts using the texture you are editing">Fix UV' +
+      (curRank ? ' · ' + (curRank + 1) : '') + '</button>');
+    if (anyChanged) rows.push('<button class="chip-btn" id="btnUVAuto" title="Put every part back to its automatic layout">Auto UV</button>');
+  }
   rows.push('<button class="chip-btn" id="btnFit" title="Fit texture in view (F)">Fit</button>');
   bar.innerHTML = rows.join('');
   const symX = $('#optSymX'), symY = $('#optSymY');
@@ -1829,6 +1947,32 @@ function syncOptions() {
     refreshUVOverlay();
     syncOptions(); needDraw = true;
   }, 'click');
+  const xfNum = (id, fn) => {
+    const el = $('#' + id);
+    if (el) el.addEventListener('change', () => {
+      const v = parseFloat(el.value);
+      if (!isFinite(v) || !xf) return;
+      fn(v);
+      renderTransform();
+      syncOptions();
+      needDraw = true;
+    });
+  };
+  xfNum('xfW', v => { const s = xf.w < 0 ? -1 : 1; xf.w = Math.max(1, v) * s; if (xf.keep) xf.h = (xf.h < 0 ? -1 : 1) * Math.max(1, v) * Math.abs(xf.h0 / (xf.w0 || 1)); });
+  xfNum('xfH', v => { const s = xf.h < 0 ? -1 : 1; xf.h = Math.max(1, v) * s; if (xf.keep) xf.w = (xf.w < 0 ? -1 : 1) * Math.max(1, v) * Math.abs(xf.w0 / (xf.h0 || 1)); });
+  xfNum('xfPct', v => {
+    const f = Math.max(0.01, v / 100);
+    xf.w = (xf.w < 0 ? -1 : 1) * xf.w0 * f;
+    xf.h = (xf.h < 0 ? -1 : 1) * xf.h0 * f;
+  });
+  xfNum('xfX', v => { xf.x = v; });
+  xfNum('xfY', v => { xf.y = v; });
+  bindPair('xfRot', v => { if (xf) { xf.rot = v; renderTransform(); needDraw = true; } });
+  bind('xfKeep', () => { if (xf) { xf.keep = !xf.keep; syncOptions(); } }, 'click');
+  bind('xfFlipH', () => { if (xf) { xf.x += xf.w; xf.w = -xf.w; renderTransform(); needDraw = true; } }, 'click');
+  bind('xfFlipV', () => { if (xf) { xf.y += xf.h; xf.h = -xf.h; renderTransform(); needDraw = true; } }, 'click');
+  bind('xfApply', () => commitTransform(), 'click');
+  bind('xfCancel', () => cancelTransform(), 'click');
   bindPair('optWet', v => { opt.wet = v / 100; });
   bindPair('optCorner', v => { opt.corner = v; });
   bindPair('optStar', v => { opt.starRatio = v / 100; });
@@ -1857,6 +2001,13 @@ function syncOptions() {
   bind('btnSampClear', () => { samplers = []; syncOptions(); needDraw = true; }, 'click');
   bind('btnNoteClear', () => { notes = []; syncOptions(); needDraw = true; }, 'click');
   bind('btnCountClear', () => { counts = []; syncOptions(); needDraw = true; }, 'click');
+  bind('btnUVDense', () => { uvDense = !uvDense; refreshUVOverlay(); syncOptions(); needDraw = true; }, 'click');
+  bind('btnForceTex', () => {
+    if (forcedTexDoc) forceTextureOnModel(null);
+    else if (curDoc >= 0 && docs[curDoc]) forceTextureOnModel(docs[curDoc].baseName);
+  }, 'click');
+  bind('btnUVFix', () => cycleUVLayout(1), 'click');
+  bind('btnUVAuto', () => resetUVLayout(), 'click');
   bind('btnFit', () => fitView(), 'click');
 }
 
@@ -1973,14 +2124,14 @@ function flipLayer(dir) {
   if (!l) return;
   pushUndo(l);
   if (l.type !== 'raster') { l.type = 'raster'; l.params = null; }
-  const tmp = cloneCanvas(l.canvas);
-  const c = ctx2d(l.canvas);
-  c.save();
-  c.clearRect(0, 0, TW, TH);
+  const out = makeCanvas(TW, TH);
+  const c = ctx2d(out);
+  c.save();                                  // leave the context clean for later edits
   if (dir === 'h') { c.translate(TW, 0); c.scale(-1, 1); }
   else { c.translate(0, TH); c.scale(1, -1); }
-  c.drawImage(tmp, 0, 0);
+  c.drawImage(l.canvas, 0, 0);
   c.restore();
+  l.canvas = out;
   invalidate();
 }
 
@@ -1989,14 +2140,14 @@ function rotateLayer90(cw) {
   if (!l) return;
   pushUndo(l);
   if (l.type !== 'raster') { l.type = 'raster'; l.params = null; }
-  const tmp = cloneCanvas(l.canvas);
-  const c = ctx2d(l.canvas);
+  const out = makeCanvas(TW, TH);
+  const c = ctx2d(out);
   c.save();
-  c.clearRect(0, 0, TW, TH);
   c.translate(TW / 2, TH / 2);
   c.rotate((cw ? 90 : -90) * Math.PI / 180);
-  c.drawImage(tmp, -TH / 2, -TW / 2, TH, TW);
+  c.drawImage(l.canvas, -TH / 2, -TW / 2, TH, TW);
   c.restore();
+  l.canvas = out;
   invalidate();
 }
 
@@ -2018,6 +2169,9 @@ function commitStroke() {
 
 function rasterizeIfNeeded(l) {
   if (l.type !== 'raster') {
+    // drop stale handles that still treat this layer as a decal / text object
+    if (typeof moving !== 'undefined' && moving && moving.layer === l) moving = null;
+    if (typeof xf !== 'undefined' && xf && xf.layer === l) { xf = null; xfDrag = null; }
     l.type = 'raster';
     l.params = null;
     toast('Layer flattened to paint on it.', 'info', 2500);
@@ -2628,7 +2782,7 @@ function applyCrop() {
     if (l.params) { l.params.x -= x; l.params.y -= y; }
   }
   TW = w; TH = h;
-  for (const c of [composite, strokeCanvas, scratch, uvCanvas]) { c.width = TW; c.height = TH; }
+  for (const c of [composite, strokeCanvas, scratch, scratch2, uvCanvas]) { c.width = TW; c.height = TH; }
   clearSelection();
   cropRect = null;
   $('#stSize').textContent = TW + '×' + TH;
@@ -2653,6 +2807,229 @@ function constrain45(x0, y0, x1, y1) {
   const a = Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) * (Math.PI / 4);
   const d = Math.hypot(dx, dy);
   return [x0 + Math.cos(a) * d, y0 + Math.sin(a) * d];
+}
+
+
+/* =====================================================================
+   FREE TRANSFORM — resize, stretch and rotate a layer or a selection
+   ===================================================================== */
+let xf = null;      // active transform session
+let xfDrag = null;  // handle being dragged
+
+// opaque bounds of a canvas, so the box hugs the artwork rather than the sheet
+function contentBounds(cv) {
+  const w = cv.width, h = cv.height;
+  let d;
+  try { d = cv.getContext('2d').getImageData(0, 0, w, h).data; } catch (e) { return { x: 0, y: 0, w, h }; }
+  let mnx = w, mny = h, mxx = -1, mxy = -1;
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      if (d[(row + x) * 4 + 3] > 4) {
+        if (x < mnx) mnx = x;
+        if (x > mxx) mxx = x;
+        if (y < mny) mny = y;
+        if (y > mxy) mxy = y;
+      }
+    }
+  }
+  if (mxx < mnx) return null;
+  return { x: mnx, y: mny, w: mxx - mnx + 1, h: mxy - mny + 1 };
+}
+
+function beginTransform() {
+  const l = activeLayer();
+  if (!l) { toast('Select a layer to transform.', 'info', 3000); return false; }
+  if (xf) return true;
+
+  pushUndo(l);
+
+  if (l.params) {
+    // decals, text and frames keep their editability — we drive their params
+    const p = l.params;
+    let w, h;
+    if (l.type === 'frame') { w = p.w; h = p.h; }
+    else if (l.type === 'decal' && p.img) {
+      w = p.img.width * p.scale;
+      h = p.img.height * (p.scaleY === undefined ? p.scale : p.scaleY);
+    } else {
+      const m = measureText(p);
+      w = m.w * (p.scale || 1);
+      h = m.h * ((p.scaleY === undefined ? p.scale : p.scaleY) || 1);
+    }
+    if (!(w > 0) || !(h > 0)) { w = Math.max(w || 1, 1); h = Math.max(h || 1, 1); }
+    xf = { layer: l, kind: 'param', x: p.x - w / 2, y: p.y - h / 2, w, h, rot: p.rot || 0, w0: w, h0: h, keep: false };
+  } else {
+    // raster: lift the pixels (or just the selection) onto a floating copy
+    // one snapshot, two derived copies: the floating piece and what stays put
+    const snap = cloneCanvas(l.canvas);
+    const src = cloneCanvas(snap);
+    const base = makeCanvas(TW, TH);
+    if (selMask) {
+      clipCanvasToSelection(src);          // the floating piece = the selection
+      const bc = ctx2d(base);
+      bc.drawImage(snap, 0, 0);            // everything...
+      bc.save();
+      bc.globalCompositeOperation = 'destination-out';
+      bc.drawImage(selMask, 0, 0);         // ...minus the bit we lifted out
+      bc.restore();
+    }
+    const b = contentBounds(src);
+    if (!b) { toast('That layer is empty — nothing to resize.', 'info', 3000); undoStack.pop(); return false; }
+    xf = { layer: l, kind: 'raster', src, base, sx: b.x, sy: b.y, sw: b.w, sh: b.h,
+           x: b.x, y: b.y, w: b.w, h: b.h, rot: 0, w0: b.w, h0: b.h, keep: false };
+  }
+  renderTransform();
+  syncOptions();
+  needDraw = true;
+  return true;
+}
+
+function renderTransform() {
+  if (!xf) return;
+  const l = xf.layer;
+  if (xf.kind === 'param') {
+    const p = l.params;
+    p.x = xf.x + xf.w / 2;
+    p.y = xf.y + xf.h / 2;
+    p.rot = xf.rot;
+    const fx = xf.w / (xf.w0 || 1), fy = xf.h / (xf.h0 || 1);
+    if (l.type === 'frame') { p.w = Math.abs(xf.w); p.h = Math.abs(xf.h); }
+    else {
+      if (p._xfBase === undefined) {
+        p._xfBase = p.scale || 1;
+        p._xfBaseY = (p.scaleY === undefined ? p.scale : p.scaleY) || 1;
+      }
+      p.scale = p._xfBase * fx;
+      p.scaleY = p._xfBaseY * fy;
+    }
+    renderParamLayer(l);
+  } else {
+    const c = ctx2d(l.canvas);
+    c.clearRect(0, 0, TW, TH);
+    c.drawImage(xf.base, 0, 0);
+    c.save();
+    c.translate(xf.x + xf.w / 2, xf.y + xf.h / 2);
+    if (xf.rot) c.rotate(xf.rot * Math.PI / 180);
+    c.imageSmoothingEnabled = true;
+    c.imageSmoothingQuality = 'high';
+    const dw = Math.abs(xf.w), dh = Math.abs(xf.h);
+    c.scale(xf.w < 0 ? -1 : 1, xf.h < 0 ? -1 : 1);
+    if (dw >= 1 && dh >= 1) c.drawImage(xf.src, xf.sx, xf.sy, xf.sw, xf.sh, -dw / 2, -dh / 2, dw, dh);
+    c.restore();
+  }
+  invalidate();
+}
+
+function commitTransform(silent) {
+  if (!xf) return;
+  const l = xf.layer;
+  if (xf.kind === 'param' && l.params) { delete l.params._xfBase; delete l.params._xfBaseY; }
+  xf = null; xfDrag = null;
+  rebuildLayerUI();
+  syncOptions();
+  invalidate();
+  if (!silent) toast('Transform applied.', 'ok', 2000);
+}
+
+function cancelTransform() {
+  if (!xf) return;
+  xf = null; xfDrag = null;
+  doUndo();
+  syncOptions();
+  needDraw = true;
+  toast('Transform cancelled.', 'info', 2000);
+}
+
+// the eight handles plus the rotate grip, in texture space
+function xfHandles() {
+  if (!xf) return [];
+  const x = xf.x, y = xf.y, w = xf.w, h = xf.h;
+  const cx = x + w / 2, cy = y + h / 2;
+  const pts = [
+    { id: 'nw', x: x, y: y }, { id: 'n', x: cx, y: y }, { id: 'ne', x: x + w, y: y },
+    { id: 'e', x: x + w, y: cy }, { id: 'se', x: x + w, y: y + h },
+    { id: 's', x: cx, y: y + h }, { id: 'sw', x: x, y: y + h }, { id: 'w', x: x, y: cy },
+    { id: 'rot', x: cx, y: y - 26 / view.scale }
+  ];
+  if (!xf.rot) return pts;
+  const a = xf.rot * Math.PI / 180, ca = Math.cos(a), sa = Math.sin(a);
+  return pts.map(p => {
+    const dx = p.x - cx, dy = p.y - cy;
+    return { id: p.id, x: cx + dx * ca - dy * sa, y: cy + dx * sa + dy * ca };
+  });
+}
+
+function xfHandleAt(tx, ty) {
+  const tol = 10 / view.scale;
+  for (const p of xfHandles()) if (Math.abs(p.x - tx) < tol && Math.abs(p.y - ty) < tol) return p.id;
+  return null;
+}
+
+function xfInside(tx, ty) {
+  if (!xf) return false;
+  const cx = xf.x + xf.w / 2, cy = xf.y + xf.h / 2;
+  let dx = tx - cx, dy = ty - cy;
+  if (xf.rot) {
+    const a = -xf.rot * Math.PI / 180;
+    const rx = dx * Math.cos(a) - dy * Math.sin(a);
+    const ry = dx * Math.sin(a) + dy * Math.cos(a);
+    dx = rx; dy = ry;
+  }
+  return Math.abs(dx) <= Math.abs(xf.w) / 2 && Math.abs(dy) <= Math.abs(xf.h) / 2;
+}
+
+/* Drag maths. Shift keeps the proportions on a corner; Alt works from the
+   centre. Side handles only ever change their own axis. */
+function applyXfDrag(tx, ty, shift, alt) {
+  const d = xfDrag;
+  if (!d || !xf) return;
+  if (d.id === 'move') {
+    xf.x = d.ox + (tx - d.sx);
+    xf.y = d.oy + (ty - d.sy);
+    renderTransform();
+    return;
+  }
+  if (d.id === 'rot') {
+    const cx = d.ox + d.ow / 2, cy = d.oy + d.oh / 2;
+    let ang = Math.atan2(ty - cy, tx - cx) * 180 / Math.PI + 90;
+    if (shift) ang = Math.round(ang / 15) * 15;
+    xf.rot = ang;
+    renderTransform();
+    return;
+  }
+  const id = d.id;
+  let left = d.ox, top = d.oy, right = d.ox + d.ow, bottom = d.oy + d.oh;
+  if (id.indexOf('w') >= 0) left = tx;
+  if (id.indexOf('e') >= 0) right = tx;
+  if (id.indexOf('n') >= 0) top = ty;
+  if (id.indexOf('s') >= 0) bottom = ty;
+
+  const corner = id.length === 2;
+  if (shift && corner && d.ow && d.oh) {
+    // lock the aspect ratio: follow whichever axis moved further
+    const ar = Math.abs(d.ow / d.oh);
+    let w = right - left, h = bottom - top;
+    if (Math.abs(w) / (ar || 1) > Math.abs(h)) h = Math.sign(h || 1) * Math.abs(w) / ar;
+    else w = Math.sign(w || 1) * Math.abs(h) * ar;
+    if (id.indexOf('w') >= 0) left = right - w; else right = left + w;
+    if (id.indexOf('n') >= 0) top = bottom - h; else bottom = top + h;
+  }
+  if (alt) {
+    // grow from the centre instead of the opposite edge
+    const cx = d.ox + d.ow / 2, cy = d.oy + d.oh / 2;
+    if (id.indexOf('w') >= 0 || id.indexOf('e') >= 0) {
+      const half = Math.abs(cx - (id.indexOf('w') >= 0 ? left : right));
+      left = cx - half; right = cx + half;
+    }
+    if (id.indexOf('n') >= 0 || id.indexOf('s') >= 0) {
+      const half = Math.abs(cy - (id.indexOf('n') >= 0 ? top : bottom));
+      top = cy - half; bottom = cy + half;
+    }
+  }
+  xf.x = left; xf.y = top;
+  xf.w = right - left; xf.h = bottom - top;
+  renderTransform();
 }
 
 viewEl.addEventListener('pointerdown', e => {
@@ -2845,6 +3222,20 @@ viewEl.addEventListener('pointerdown', e => {
     return;
   }
 
+  /* ---- free transform ---- */
+  if (tool === 'transform') {
+    if (!xf && !beginTransform()) return;
+    const hit = xfHandleAt(tx, ty);
+    if (hit) {
+      xfDrag = { id: hit, sx: tx, sy: ty, ox: xf.x, oy: xf.y, ow: xf.w, oh: xf.h };
+    } else if (xfInside(tx, ty)) {
+      xfDrag = { id: 'move', sx: tx, sy: ty, ox: xf.x, oy: xf.y, ow: xf.w, oh: xf.h };
+    } else {
+      commitTransform();   // clicking away applies it, like Photoshop
+    }
+    return;
+  }
+
   /* ---- content-aware move ---- */
   if (tool === 'camove') {
     if (!l || l.type !== 'raster') { toast('Pick a normal (raster) layer for this.', 'info', 3200); return; }
@@ -2878,7 +3269,7 @@ viewEl.addEventListener('pointerdown', e => {
       return;
     }
     pushUndo(l.type === 'raster' ? l : null);
-    if (l.params) moving = { mode: 'param', layer: l, sx: tx, sy: ty, ox: l.params.x, oy: l.params.y };
+    if (l.params && l.type !== 'raster') moving = { mode: 'param', layer: l, sx: tx, sy: ty, ox: l.params.x, oy: l.params.y };
     else moving = { mode: 'raster', layer: l, sx: tx, sy: ty };
     return;
   }
@@ -2984,6 +3375,11 @@ viewEl.addEventListener('pointermove', e => {
     floatSel.dx = tx - floatSel.sx;
     floatSel.dy = ty - floatSel.sy;
     invalidate();
+    return;
+  }
+  if (xfDrag) {
+    applyXfDrag(tx, ty, e.shiftKey || xf.keep, e.altKey);
+    needDraw = true;
     return;
   }
   if (perspDrag !== null && perspPts) {
@@ -3162,6 +3558,7 @@ function endPointer() {
     floatSel = null;
     invalidate();
   }
+  if (xfDrag) { xfDrag = null; syncOptions(); needDraw = true; }
   if (perspDrag !== null) { perspDrag = null; needDraw = true; }
   if (sliceDrag) { sliceDrag = null; needDraw = true; }
   if (rotDrag) { rotDrag = null; syncOptions(); }
@@ -3206,11 +3603,14 @@ function endPointer() {
     if (moving.mode === 'raster') {
       const l = moving.layer;
       if (l.pdx || l.pdy) {
-        scratchCtx.clearRect(0, 0, TW, TH);
-        scratchCtx.drawImage(l.canvas, l.pdx, l.pdy);
-        const c = ctx2d(l.canvas);
-        c.clearRect(0, 0, TW, TH);
-        c.drawImage(scratch, 0, 0);
+        /* Compose into a fresh canvas and swap it in, rather than clearing the
+           live layer and drawing back into it. Round-tripping through a canvas
+           we have just cleared depends on that context being in a pristine
+           state; building a new one cannot go wrong. */
+        const shifted = makeCanvas(TW, TH);
+        const sc = ctx2d(shifted);
+        sc.drawImage(l.canvas, l.pdx, l.pdy);
+        l.canvas = shifted;
       }
       l.pdx = 0; l.pdy = 0;
     }
@@ -3253,7 +3653,9 @@ window.addEventListener('keydown', e => {
   if (ctrl && k === 'j') { e.preventDefault(); $('#btnLayerDup').click(); return; }
   if (ctrl) return;
   if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); deleteSelection(); return; }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 't') { e.preventDefault(); setTool('transform'); beginTransform(); return; }
   if (e.key === 'Enter') {
+    if (xf) { commitTransform(); return; }
     if (tool === 'polyLasso') closePolyLasso();
     else if (PEN_TOOLS.has(tool) && penAnchors.length > 1) penStroke();
     else if (perspPts) applyPerspectiveCrop();
@@ -3261,6 +3663,7 @@ window.addEventListener('keydown', e => {
     return;
   }
   if (e.key === 'Escape') {
+    if (xf) { cancelTransform(); return; }
     if (penAnchors.length) { clearPen(); syncOptions(); return; }
     if (perspPts) { perspPts = null; syncOptions(); needDraw = true; return; }
   }
@@ -3604,6 +4007,7 @@ function materialForNames(names) {
       roughness: 0.62, metalness: 0.15, alphaTest: 0.01
     });
     m.userData.texNames = names || [];
+    m.userData.texSlots = null;
     matCache.set(key, m);
   }
   return m;
@@ -3629,6 +4033,7 @@ function setModel(geos, opts = {}) {
     const idx = bg.getIndex();
     tris += (idx ? idx.count : bg.getAttribute('position').count) / 3;
     const mat = (opts.multiTex && g.texNames !== undefined) ? materialForNames(g.texNames) : sharedMat;
+    if (mat && mat.userData && g.texSlots && !mat.userData.texSlots) mat.userData.texSlots = g.texSlots;
     modelGroup.add(new THREE.Mesh(bg, mat));
   }
   if (opts.zUp) modelGroup.rotation.x = -Math.PI / 2;
@@ -3667,6 +4072,7 @@ function findDocByTexName(nm) {
 
 function bakeDocTex(d) {
   d.comp = compositeDoc(d);
+  clearDocCoverage(d);
   if (d.tex) { d.tex.image = d.comp; d.tex.needsUpdate = true; }
 }
 
@@ -3681,22 +4087,116 @@ function ensureDocTex(d) {
   return d.tex;
 }
 
+
+/* Some shader slots point at masks rather than artwork — an opacity map for a
+   roller shutter, a tiny flat swatch for paintwork the game colours itself.
+   A fully transparent map used as a colour map makes the part vanish, so we
+   measure each texture once and refuse to bind blank ones. */
+function docCoverage(d) {
+  if (d._cov !== undefined) return d._cov;
+  let opaque = 0, n = 0;
+  try {
+    // make sure the tab being edited has its live layers written back first,
+    // then measure from the document itself so this never depends on view state
+    if (curDoc >= 0 && docs[curDoc] === d) saveCur();
+    const c = compositeDoc(d);
+    const S = 32;
+    const small = makeCanvas(S, S);
+    const g = small.getContext('2d');
+    g.drawImage(c, 0, 0, S, S);
+    const px = g.getImageData(0, 0, S, S).data;
+    for (let i = 3; i < px.length; i += 4) { n++; if (px[i] > 24) opaque++; }
+  } catch (err) { return (d._cov = 1); }
+  d._cov = n ? opaque / n : 1;
+  return d._cov;
+}
+function clearDocCoverage(d) { if (d) delete d._cov; }
+
 function rebindMaterials() {
   if (!matCache.size) return;
   for (const m of matCache.values()) {
+    const slots = m.userData.texSlots;
     const names = m.userData.texNames || [];
-    let tex = null;
-    for (const nm of names) {
+
+    /* Choose which texture actually gets painted on this part.
+
+       Taking the first listed texture is wrong: on this kind of vehicle the
+       paint shader lists a 4x4 grey placeholder as DiffuseSampler and hangs
+       the real livery off DiffuseSampler2. So we only consider slots that are
+       colour maps, prefer real artwork over stand-ins, and let the largest
+       texture win — a 4096px livery beats a 4px placeholder. */
+    const cands = [];
+    // when the shader told us each slot's job, trust it: a spec or normal map is
+    // never a stand-in for missing paint
+    const rolesKnown = !!(slots && slots.some(s => s.role));
+    const consider = (nm, paint, order) => {
       const di = findDocByTexName(nm);
-      if (di >= 0) {
-        tex = (di === curDoc) ? threeTex : ensureDocTex(docs[di]);
-        if (tex) break;
-      }
+      if (di < 0) return;
+      const d = docs[di];
+      const area = (d.tw || 0) * (d.th || 0);
+      const placeholder = PLACEHOLDER_TEX.test(nm) || area <= 64 * 64;
+      const blank = docCoverage(d) < 0.02;   // effectively an empty / mask texture
+      cands.push({ di, nm, paint, order, area, placeholder, blank });
+    };
+    if (slots && slots.length) {
+      for (const s of slots) consider(s.name, s.paint, s.order);
+    } else {
+      names.forEach((nm, i) => consider(nm, !NONPAINT_TEX.test(nm), 50 + i));
     }
+
+    let pick = null;
+    if (forcedTexDoc) {
+      const fi = docs.findIndex(d => normTex(d.baseName || '') === forcedTexDoc);
+      if (fi >= 0 && (!cands.length || cands.some(c => c.paint))) pick = { di: fi, nm: docs[fi].baseName };
+    }
+    if (!pick && cands.length) {
+      const usable = cands.filter(c => !c.blank);   // never bind an all-transparent map
+      const paints = usable.filter(c => c.paint);
+      // with known roles and no usable colour map, show the part plain rather
+      // than smearing a normal or spec map over it
+      const pool = paints.length ? paints : (rolesKnown ? [] : usable);
+      const real = pool.filter(c => !c.placeholder);
+      const finalPool = real.length ? real : pool;
+      finalPool.sort((a, b) => (b.area - a.area) || (a.order - b.order));
+      pick = finalPool[0] || null;
+    }
+
+    let tex = null;
+    if (pick) tex = (pick.di === curDoc) ? threeTex : ensureDocTex(docs[pick.di]);
     m.map = tex;
     m.color.set(tex ? 0xffffff : 0x878c94); // untextured parts read as neutral gray
+    // a part with no usable colour map must still be visible, not invisible
+    m.transparent = !!tex;
+    m.alphaTest = tex ? 0.01 : 0;
+    m.opacity = 1;
+    m.userData.boundTex = pick ? pick.nm : null;
     m.needsUpdate = true;
   }
+}
+
+// Which open textures are actually showing on the model right now?
+function boundTextureNames() {
+  const set = new Set();
+  for (const m of matCache.values()) if (m.userData.boundTex) set.add(normTex(m.userData.boundTex));
+  return set;
+}
+
+/* If the automatic choice still leaves the texture you are editing invisible
+   (unusual shaders, renamed textures), let the user pin it onto the body. */
+let forcedTexDoc = null;
+
+function forceTextureOnModel(name) {
+  forcedTexDoc = name ? normTex(name) : null;
+  rebindMaterials();
+  needDraw = true;
+  syncOptions();
+  if (forcedTexDoc) toast('Showing "' + name + '" on every painted part of the model.', 'ok', 3600);
+  else toast('Back to the textures the model asks for.', 'info', 2600);
+}
+
+function activeTexIsVisible() {
+  if (curDoc < 0 || !docs[curDoc] || !matCache.size) return true;
+  return boundTextureNames().has(normTex(docs[curDoc].baseName || ''));
 }
 
 /* The render loop is scheduled from BOTH windows: browsers pause a window's
@@ -3769,22 +4269,53 @@ function buildUVOverlay(geos) {
   uvSourceGeos = geos;
   const c = ctx2d(uvCanvas);
   c.clearRect(0, 0, TW, TH);
-  c.strokeStyle = 'rgba(120,220,255,.75)';
-  c.lineWidth = Math.max(1, TW / 2048);
+  c.strokeStyle = 'rgba(120,220,255,.85)';
+  c.lineWidth = Math.max(1, TW / 1400);
+
+  /* Vehicle body panels run to tens of thousands of triangles each, so a full
+     wireframe is a solid haze you cannot paint against. By default we draw
+     only the edges that belong to a single triangle — the outline of each UV
+     island — which is ~4% of the edges and actually shows you where the
+     panels sit. "Dense" restores the full wireframe. */
+  c.beginPath();
   for (const g of geos) {
     const uv = g.uvs, idx = g.indices;
     if (!uv) continue;
-    c.beginPath();
-    const tri = (a, b, d) => {
-      c.moveTo(uv[a * 2] * TW, uv[a * 2 + 1] * TH);
-      c.lineTo(uv[b * 2] * TW, uv[b * 2 + 1] * TH);
-      c.lineTo(uv[d * 2] * TW, uv[d * 2 + 1] * TH);
-      c.closePath();
+    const n = idx ? idx.length : (uv.length / 2);
+    if (uvDense) {
+      for (let i = 0; i + 2 < n; i += 3) {
+        const a = idx ? idx[i] : i, b = idx ? idx[i + 1] : i + 1, d = idx ? idx[i + 2] : i + 2;
+        c.moveTo(uv[a * 2] * TW, uv[a * 2 + 1] * TH);
+        c.lineTo(uv[b * 2] * TW, uv[b * 2 + 1] * TH);
+        c.lineTo(uv[d * 2] * TW, uv[d * 2 + 1] * TH);
+        c.closePath();
+      }
+      continue;
+    }
+    // weld by uv position so shared edges cancel out and only borders remain
+    const counts = new Map();
+    const keyOf = (p, q) => {
+      const ax = Math.round(uv[p * 2] * 8192), ay = Math.round(uv[p * 2 + 1] * 8192);
+      const bx = Math.round(uv[q * 2] * 8192), by = Math.round(uv[q * 2 + 1] * 8192);
+      const s1 = ax + ',' + ay, s2 = bx + ',' + by;
+      return s1 < s2 ? s1 + '|' + s2 : s2 + '|' + s1;
     };
-    if (idx) { for (let i = 0; i < idx.length; i += 3) tri(idx[i], idx[i + 1], idx[i + 2]); }
-    else { const n = uv.length / 2; for (let i = 0; i + 2 < n; i += 3) tri(i, i + 1, i + 2); }
-    c.stroke();
+    for (let i = 0; i + 2 < n; i += 3) {
+      const a = idx ? idx[i] : i, b = idx ? idx[i + 1] : i + 1, d = idx ? idx[i + 2] : i + 2;
+      for (const pair of [[a, b], [b, d], [d, a]]) {
+        const kk = keyOf(pair[0], pair[1]);
+        const e = counts.get(kk);
+        if (e) e.n++;
+        else counts.set(kk, { n: 1, p: pair[0], q: pair[1] });
+      }
+    }
+    for (const e of counts.values()) {
+      if (e.n !== 1) continue;
+      c.moveTo(uv[e.p * 2] * TW, uv[e.p * 2 + 1] * TH);
+      c.lineTo(uv[e.q * 2] * TW, uv[e.q * 2 + 1] * TH);
+    }
   }
+  c.stroke();
   // note: overlay uvs are stored image-style (v measured from the top)
 }
 
@@ -4316,8 +4847,36 @@ function fmtName(fmt) {
 // fixed conventional sizes per vertex-flag bit (GTA V default layouts)
 const VERT_SIZES = [12, 4, 4, 12, 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 16, 16];
 
-// Read the drawable's shader group: for each shader, the texture names its
-// parameters reference (texture params sit first in the parameter array).
+/* ---------------------------------------------------------------------
+   Shader texture roles.
+
+   A shader's texture parameters are stored as an array, and a parallel array
+   of Jenkins hashes names each one ("DiffuseSampler", "SpecSampler", ...).
+   That hash array sits inside the parameter block at the offset held in the
+   shader header, so we can tell what each texture is FOR instead of assuming
+   the first one is the paint.
+
+   This matters on real vehicles: the paint is often not the first parameter,
+   and on livery shaders DiffuseSampler can be a tiny grey placeholder while
+   the actual livery hangs off DiffuseSampler2.
+   ------------------------------------------------------------------ */
+const SAMPLER_ROLES = (() => {
+  const paint = ['DiffuseSampler', 'DiffuseSampler2', 'DiffuseExtraSampler', 'DiffuseHfSampler',
+                 'TextureSampler', 'plateBgSampler', 'DiffuseSamplerP', 'GlobalDiffuseSampler'];
+  const other = ['BumpSampler', 'SpecSampler', 'NormalSampler', 'SpecularSampler', 'DetailSampler',
+                 'DirtSampler', 'DamageSampler', 'EnvironmentSampler', 'TintPaletteSampler',
+                 'SnowSampler', 'FlowSampler', 'StippleSampler', 'FogSampler', 'HeightSampler',
+                 'distanceMapSampler', 'plateBgBumpSampler'];
+  const m = new Map();
+  paint.forEach((n, i) => m.set(jenkinsHash(n) >>> 0, { name: n, paint: true, order: i }));
+  other.forEach(n => m.set(jenkinsHash(n) >>> 0, { name: n, paint: false, order: 99 }));
+  return m;
+})();
+
+// Stand-ins rather than real artwork.
+const PLACEHOLDER_TEX = /^(vehicle_generic_|blank_|null$|none$|default$|black$|white$|grey$|gray$)/i;
+const NONPAINT_TEX = /(spec(map)?$|normal$|_n$|bump$|dirt|mud|damage|burnt|detail$)/i;
+
 function parseShaderTextures(rsc, drawOff) {
   const s = rsc.sdv;
   const out = [];
@@ -4327,26 +4886,45 @@ function parseShaderTextures(rsc, drawOff) {
     const listP = rsc.ptr(s, sgP.off + 0x10);
     const count = s.getUint16(sgP.off + 0x18, true);
     if (!listP || listP.seg !== 5 || count < 1 || count > 256) return out;
+
     for (let i = 0; i < count; i++) {
-      const names = [];
+      const slots = [];
       const shP = rsc.ptr(s, listP.off + i * 8);
       if (shP && shP.seg === 5) {
         const parP = rsc.ptr(s, shP.off);
         if (parP && parP.seg === 5) {
-          for (let k = 0; k < 16; k++) {
+          const hashOff = s.getUint16(shP.off + 0x14, true);
+          const pCount = s.getUint8(shP.off + 0x18);
+          const hbase = parP.off + hashOff;
+          const haveHashes = pCount > 0 && pCount <= 128 && hbase + pCount * 4 <= s.byteLength;
+
+          for (let k = 0; k < (pCount || 16); k++) {
             const pOff = parP.off + k * 16;
             if (pOff + 16 > s.byteLength) break;
-            if (s.getUint8(pOff) !== 0) break; // past the texture params
+            if (s.getUint8(pOff) !== 0) break; // texture params come first
             const texP = rsc.ptr(s, pOff + 8);
             if (!texP || texP.seg !== 5) continue; // unset sampler slot
             const nmP = rsc.ptr(s, texP.off + 0x28);
             if (!nmP || nmP.seg !== 5) continue;
             const nm = readCString(rsc.sys, nmP.off);
-            if (nm) names.push(nm.split(/[\\\/]/).pop());
+            if (!nm) continue;
+            const clean = nm.split(/[\\\/]/).pop();
+            let role = null;
+            if (haveHashes) {
+              const h = s.getUint32(hbase + k * 4, true) >>> 0;
+              role = SAMPLER_ROLES.get(h) || null;
+            }
+            slots.push({
+              name: clean,
+              role: role ? role.name : null,
+              // with no role table, judge by the texture's own name
+              paint: role ? role.paint : !NONPAINT_TEX.test(clean),
+              order: role ? role.order : 50
+            });
           }
         }
       }
-      out.push(names);
+      out.push(slots);
     }
   } catch (err) { /* shader info is a bonus — geometry still loads without it */ }
   return out;
@@ -4378,7 +4956,9 @@ function parseDrawableGeometries(rsc, drawOff) {
           if (g) {
             let si = 0xFFFF;
             if (mapP && mapP.seg === 5 && mapP.off + gi * 2 + 2 <= s.byteLength) si = s.getUint16(mapP.off + gi * 2, true);
-            g.texNames = (si !== 0xFFFF && shaderTex[si]) ? shaderTex[si] : [];
+            const slots = (si !== 0xFFFF && shaderTex[si]) ? shaderTex[si] : [];
+            g.texSlots = slots;
+            g.texNames = slots.slice().sort((a, b) => (b.paint - a.paint) || (a.order - b.order)).map(x => x.name);
             geos.push(g);
           }
         } catch (err) { /* skip broken geometry */ }
@@ -4452,60 +5032,187 @@ function decodeUVAt(dv, base, stride, vCount, off, half) {
 
 // Work out where texcoord0 lives, using the declaration as a hint but
 // verifying against the data itself.
-function findTexcoords(dv, base, stride, vCount, flags, types) {
+function uvCandidateList(stride, flags, types) {
   const candidates = [];
-  const addDeclCandidates = () => {
-    if (!(flags & (1 << 6))) return;
-    // (a) sizes straight from the Types nibbles
-    if (types !== null) {
-      let off = 0, uvOff = -1, ok = true;
-      for (let bit = 0; bit < 16; bit++) {
-        if (!(flags & (1 << bit))) continue;
-        const t = Number((types >> BigInt(bit * 4)) & 0xFn);
-        const sz = VC_SIZE[t];
-        if (sz === undefined || sz === 0) { ok = false; break; }
-        if (bit === 6) { uvOff = off; }
-        off += sz;
-      }
-      if (ok && uvOff >= 0) {
-        const t6 = Number((types >> BigInt(24)) & 0xFn);
-        const half = VC_SIZE[t6] === 4;
-        if (off === stride) candidates.push({ off: uvOff, half, bonus: 0.6 });
-        else candidates.push({ off: uvOff, half, bonus: 0.15 });
-      }
-    }
-    // (b) legacy fixed-size guesses, both texcoord widths
-    for (const uvSize of [8, 4]) {
-      let off = 0, uvOff = -1;
-      for (let bit = 0; bit < 16; bit++) {
-        if (!(flags & (1 << bit))) continue;
-        if (bit === 6) uvOff = off;
-        off += (bit >= 6 && bit <= 13) ? uvSize : VERT_SIZES[bit];
-      }
-      if (uvOff >= 0) candidates.push({ off: uvOff, half: uvSize === 4, bonus: off === stride ? 0.4 : 0 });
-    }
-  };
-  addDeclCandidates();
-  // (c) exhaustive sweep — the safety net when the declaration is unusual
-  for (let off = 12; off + 4 <= stride; off += 2) {
-    candidates.push({ off, half: true, bonus: 0 });
-    if (off + 8 <= stride) candidates.push({ off, half: false, bonus: 0 });
-  }
-
-  let best = null;
   const seen = new Set();
-  for (const c of candidates) {
-    const key = c.off + ':' + (c.half ? 'h' : 'f');
-    if (seen.has(key)) continue;
+  const add = (off, half, bonus, chan) => {
+    if (off < 0) return;
+    if (off + (half ? 4 : 8) > stride) return;
+    const key = off + ':' + (half ? 'h' : 'f');
+    if (seen.has(key)) return;
     seen.add(key);
+    candidates.push({ off, half, bonus, chan: chan === undefined ? 9 : chan });
+  };
+
+  // (a) sizes straight from the declaration's type nibbles
+  if (types !== null) {
+    let off = 0, ok = true;
+    const uvOffs = {};
+    for (let bit = 0; bit < 16; bit++) {
+      if (!(flags & (1 << bit))) continue;
+      const t = Number((types >> BigInt(bit * 4)) & 0xFn);
+      const sz = VC_SIZE[t];
+      if (sz === undefined || sz === 0) { ok = false; break; }
+      if (bit >= 6 && bit <= 13) uvOffs[bit] = { off, half: sz === 4 };
+      off += sz;
+    }
+    if (ok) {
+      const exact = off === stride;
+      for (const bit of Object.keys(uvOffs)) {
+        const chan = +bit - 6;
+        const u = uvOffs[bit];
+        add(u.off, u.half, (exact ? 1.0 : 0.15) - chan * 0.25, chan);
+      }
+    }
+  }
+  // (b) fixed-size fallbacks, both texcoord widths
+  for (const uvSize of [8, 4]) {
+    let off = 0;
+    const uvOffs = {};
+    for (let bit = 0; bit < 16; bit++) {
+      if (!(flags & (1 << bit))) continue;
+      if (bit >= 6 && bit <= 13) uvOffs[bit] = off;
+      off += (bit >= 6 && bit <= 13) ? uvSize : VERT_SIZES[bit];
+    }
+    const exact = off === stride;
+    for (const bit of Object.keys(uvOffs)) {
+      const chan = +bit - 6;
+      add(uvOffs[bit], uvSize === 4, (exact ? 0.9 : 0) - chan * 0.25, chan);
+    }
+  }
+  // (c) exhaustive sweep — the safety net for unusual declarations
+  for (let off = 12; off + 4 <= stride; off += 2) {
+    add(off, true, 0);
+    add(off, false, 0);
+  }
+  return candidates;
+}
+
+// Score every candidate for one geometry. Returns [{off, half, score, ...}].
+function scoreUVCandidates(dv, base, stride, vCount, cands) {
+  const out = [];
+  for (const c of cands) {
     const uv = decodeUVAt(dv, base, stride, vCount, c.off, c.half);
     if (!uv) continue;
     const s = scoreUVs(uv);
     if (s < 0) continue;
-    const total = s + (c.bonus || 0) - c.off * 0.0008;   // nudge toward texcoord0
-    if (!best || total > best.total) best = { total, uv, off: c.off, half: c.half };
+    out.push({ off: c.off, half: c.half, chan: c.chan, bonus: c.bonus || 0, score: s });
   }
-  return best;
+  return out;
+}
+
+/* Decide the texcoord layout ONCE PER VERTEX FORMAT for the whole model.
+
+   Deciding per mesh is unreliable: a small part (a door handle, a lamp) whose
+   UVs occupy a tiny patch scores ambiguously, and a second texcoord channel
+   sitting a few bytes away scores almost as well. Every mesh sharing a vertex
+   declaration must use the same offset, so we pool the evidence across the
+   model, weighted by vertex count, and let the big meshes decide. */
+/* `rankFor` may be a plain number (same rank everywhere, used by tests) or a
+   Map of format key -> rank, so one vehicle can hold a different layout choice
+   for each of its vertex formats. */
+function resolveUVLayouts(geos, rankFor) {
+  const rankOf = key => {
+    if (typeof rankFor === 'number') return rankFor;
+    if (rankFor && typeof rankFor.get === 'function') return rankFor.get(key) || 0;
+    return 0;
+  };
+  const groups = new Map();
+  for (const g of geos) {
+    const d = g._uv;
+    if (!d) continue;
+    const key = d.flags + ':' + d.stride;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(g);
+  }
+  const summary = [];
+  for (const [key, list] of groups) {
+    const d0 = list[0]._uv;
+    const cands = uvCandidateList(d0.stride, d0.flags, d0.types);
+    if (!cands.length) continue;
+    // pool scores over the largest meshes in the group
+    const sample = list.slice().sort((a, b) => b._uv.vCount - a._uv.vCount).slice(0, 12);
+    const totals = new Map();
+    let weightSum = 0;
+    for (const g of sample) {
+      const d = g._uv;
+      const w = Math.sqrt(d.vCount);
+      weightSum += w;
+      for (const s of scoreUVCandidates(d.dv, d.base, d.stride, d.vCount, cands)) {
+        const k = s.off + ':' + (s.half ? 'h' : 'f');
+        const cur = totals.get(k) || { off: s.off, half: s.half, chan: s.chan, bonus: s.bonus, acc: 0, seen: 0 };
+        cur.acc += s.score * w;
+        cur.seen += w;
+        totals.set(k, cur);
+      }
+    }
+    if (!totals.size) continue;
+
+    /* Reject layouts whose UVs collapse to (almost) a point. Reading the wrong
+       part of a vertex often yields a near-constant value, which maps every
+       triangle onto one texel. That renders as a clean flat colour and can look
+       plausible on a mostly-red vehicle, while actually losing all the artwork,
+       so these must never be offered as alternatives. */
+    for (const c of totals.values()) {
+      let mnu = Infinity, mxu = -Infinity, mnv = Infinity, mxv = -Infinity, seen = 0;
+      for (const g of sample) {
+        const d = g._uv;
+        const uv = decodeUVAt(d.dv, d.base, d.stride, d.vCount, c.off, c.half);
+        if (!uv) continue;
+        const step = Math.max(2, Math.floor(uv.length / 400)) * 2;
+        for (let i = 0; i < uv.length; i += step) {
+          const u = uv[i], v = uv[i + 1];
+          if (!isFinite(u) || !isFinite(v)) continue;
+          if (u < mnu) mnu = u; if (u > mxu) mxu = u;
+          if (v < mnv) mnv = v; if (v > mxv) mxv = v;
+          seen++;
+        }
+      }
+      c.span = (seen && isFinite(mnu)) ? Math.min(4, (mxu - mnu)) * Math.min(4, (mxv - mnv)) : 0;
+    }
+    for (const [k, c] of [...totals.entries()]) {
+      if (c.span < 0.002) totals.delete(k);   // collapsed to a point / a line
+    }
+    if (!totals.size) continue;
+    let ranked = [...totals.values()].map(c => {
+      // candidates that fail on some meshes are penalised for inconsistency
+      const coverage = weightSum > 0 ? c.seen / weightSum : 0;
+      const mean = c.seen > 0 ? c.acc / c.seen : 0;
+      // vertex components are 4-byte aligned; an offset that is not is almost
+      // certainly straddling two real components
+      const misaligned = (c.off % 4) !== 0 ? 0.5 : 0;
+      return Object.assign({}, c, { total: mean * coverage + c.bonus - misaligned, span: c.span });
+    }).sort((a, b) => b.total - a.total);
+
+    /* When a mesh carries several texcoord channels they all decode to
+       believable UVs, so raw score cannot separate them. texcoord0 — the
+       livery mapping — always sits before the extra channels in the vertex,
+       so among candidates that are effectively tied, take the earliest
+       aligned one. This is what stops the damage/lightmap channel being
+       mistaken for the paint mapping. */
+    const bestScore = ranked.length ? ranked[0].total : 0;
+    const tied = ranked.filter(c => c.total >= bestScore - 0.08 && (c.off % 4) === 0);
+    if (tied.length) {
+      let earliest = tied[0];
+      for (const c of tied) if (c.off < earliest.off) earliest = c;
+      ranked = [earliest].concat(ranked.filter(c => c !== earliest));
+    }
+    const pick = ranked[Math.min(rankOf(key), ranked.length - 1)];
+    for (const g of list) {
+      const d = g._uv;
+      const uv = decodeUVAt(d.dv, d.base, d.stride, d.vCount, pick.off, pick.half);
+      if (!uv) { g.uvs = null; continue; }
+      const out = new Float32Array(uv.length);
+      for (let i = 0; i < uv.length; i += 2) {
+        out[i] = uv[i];
+        out[i + 1] = 1 - uv[i + 1];   // GTA measures v from the top
+      }
+      g.uvs = out;
+      g._uvRanked = ranked;
+    }
+    summary.push({ key, meshes: list.length, off: pick.off, half: pick.half, options: ranked.length, span: pick.span, rank: rankOf(key) });
+  }
+  return summary;
 }
 
 function readGeometry(rsc, gOff) {
@@ -4550,15 +5257,10 @@ function readGeometry(rsc, gOff) {
     positions[i * 3] = x; positions[i * 3 + 1] = y; positions[i * 3 + 2] = z;
   }
 
-  const found = findTexcoords(dv, base, stride, vCount, flags, types);
+  // Texcoords are NOT resolved here: the layout is decided once for the whole
+  // model in resolveUVLayouts, so every mesh sharing a vertex format agrees.
+  const uvCtx = { dv, base, stride, vCount, flags, types };
   let uvs = null;
-  if (found) {
-    uvs = new Float32Array(vCount * 2);
-    for (let i = 0; i < vCount; i++) {
-      uvs[i * 2] = found.uv[i * 2];
-      uvs[i * 2 + 1] = 1 - found.uv[i * 2 + 1];   // GTA measures v from the top
-    }
-  }
 
   // index buffer
   const ib = ibP.off;
@@ -4574,7 +5276,7 @@ function readGeometry(rsc, gOff) {
     if (v >= vCount) return null;
     indices[i] = v;
   }
-  return { positions, uvs, indices, vbOff: dataP.off };
+  return { positions, uvs, indices, vbOff: dataP.off, _uv: uvCtx };
 }
 
 function looksLikeDrawable(rsc, off) {
@@ -4606,11 +5308,94 @@ function parseDrawableFile(buf, ext) {
     if (geos.length) break;
   }
   if (!geos.length) throw new Error('Could not extract geometry from this ' + ext.toUpperCase() + ' — the layout was not recognized. Export the model as OBJ with CodeWalker instead.');
+  resolveUVLayouts(geos, 0);
   const textures = scanTextures(rsc);
   return { geos, textures, rsc };
 }
 
 
+
+
+/* If the automatic choice is still wrong for an unusual file, let the user
+   step through the runner-up layouts rather than being stuck. */
+let uvLayoutRank = 0;          // kept for the label; the real state is per format
+let uvRanks = new Map();       // vertex-format key -> chosen layout rank
+
+// which vertex formats do the parts using the current texture belong to?
+function formatsForActiveTexture() {
+  const keys = new Set();
+  if (!rawModelGeos) return keys;
+  const want = (curDoc >= 0 && docs[curDoc]) ? normTex(docs[curDoc].baseName || '') : null;
+  for (const g of rawModelGeos) {
+    if (!g._uv) continue;
+    if (want && rawModelMulti) {
+      if (!(g.texNames || []).some(n => normTex(n) === want)) continue;
+    }
+    keys.add(g._uv.flags + ':' + g._uv.stride);
+  }
+  // no part uses this texture — fall back to every format so the button still works
+  if (!keys.size) for (const g of rawModelGeos) if (g._uv) keys.add(g._uv.flags + ':' + g._uv.stride);
+  return keys;
+}
+
+function maxOptionsFor(keys) {
+  let m = 1;
+  if (!rawModelGeos) return m;
+  for (const g of rawModelGeos) {
+    if (!g._uv || !g._uvRanked) continue;
+    if (!keys.has(g._uv.flags + ':' + g._uv.stride)) continue;
+    m = Math.max(m, g._uvRanked.length);
+  }
+  return m;
+}
+
+function rebuildAfterUVChange() {
+  resolveUVLayouts(rawModelGeos, uvRanks);
+  setModel(rawModelGeos, { zUp: rawModelZUp, name: rawModelName, multiTex: rawModelMulti });
+  refreshUVOverlay();
+  rebindMaterials();
+  needDraw = true;
+  syncOptions();
+}
+
+function resetUVLayout() {
+  if (!rawModelGeos || !rawModelGeos.length) return;
+  uvLayoutRank = 0;
+  uvRanks = new Map();
+  rebuildAfterUVChange();
+  toast('Every part is back to its automatic UV layout.', 'ok', 3000);
+}
+
+function cycleUVLayout(delta) {
+  if (!rawModelGeos || !rawModelGeos.length) { toast('Import a model first.', 'info', 2600); return; }
+  if (!rawModelGeos.some(g => g._uv)) {
+    toast('This model came from an OBJ or glTF, so its UVs are already exact — nothing to cycle.', 'info', 4500);
+    return;
+  }
+
+  /* Only change the formats used by the parts wearing the texture you are
+     editing. A vehicle mixes several vertex formats, and forcing one choice on
+     all of them fixes one panel while breaking another — which is why this
+     used to need flipping back and forth. */
+  const keys = formatsForActiveTexture();
+  const maxOpts = maxOptionsFor(keys);
+  let cur = 0;
+  for (const k of keys) cur = Math.max(cur, uvRanks.get(k) || 0);
+  const next = ((cur + delta) % maxOpts + maxOpts) % maxOpts;
+  for (const k of keys) uvRanks.set(k, next);
+  uvLayoutRank = next;
+
+  const summary = rebuildAfterUVChange();
+  const info = resolveUVLayouts(rawModelGeos, uvRanks).filter(s => keys.has(s.key));
+  const span = info.length ? Math.max(...info.map(s => s.span || 0)) : 0;
+  const meshes = info.reduce((n, s) => n + s.meshes, 0);
+  const texName = (curDoc >= 0 && docs[curDoc]) ? (docs[curDoc].baseName || 'this texture') : 'this texture';
+  toast('UV layout ' + (next + 1) + ' of ' + maxOpts + ' for the ' + meshes + ' part' + (meshes === 1 ? '' : 's') +
+        ' using "' + texName + '"' +
+        (next === 0 ? ' — the automatic choice' : '') +
+        (span ? ' · uses ' + Math.round(Math.min(1, span) * 100) + '% of the sheet' : '') +
+        '. Other textures are left alone.', 'info', 6000);
+}
 
 /* =====================================================================
    PATHS — pen, freeform pen, curvature pen, anchor editing
@@ -5596,7 +6381,12 @@ function writeYTD(texs, opts) {
 
   // ---- system segment layout ----
   const DICT_LEN = 0x40;
-  const TEX_LEN = 0x80;            // sizeof(grcTexturePC)
+  /* sizeof(grcTexturePC) is 0x90, confirmed against retail files: every texture
+     in a stock dictionary sits exactly 0x90 apart. Packing them any tighter
+     makes the game read the following bytes (our name strings) as the struct's
+     trailing pointer fields, which fails with
+     "Invalid fixup, address is neither virtual nor physical". */
+  const TEX_LEN = 0x90;
   let p = align(DICT_LEN, 16);
   const hashOff = p; p = align(p + n * 4, 16);
   const listOff = p; p = align(p + n * 8, 16);
@@ -5646,7 +6436,8 @@ function writeYTD(texs, opts) {
   blobs.forEach((b, i) => {
     const o = texOff[i];
     sv.setUint32(o + 0x28, PTR(5, nameOff[i]), true);   // name pointer
-    sys[o + 0x40] = 6;                                   // usage: DIFFUSE
+    sv.setUint32(o + 0x30, 0x00800001, true);            // constant in every retail texture
+    sv.setUint32(o + 0x40, 0x20001001, true);            // usage flags, as retail files use
     sv.setUint16(o + 0x50, b.w, true);
     sv.setUint16(o + 0x52, b.h, true);
     sv.setUint16(o + 0x54, 1, true);                     // depth
@@ -5831,6 +6622,7 @@ function parseDrawableDictionaryFile(buf) {
   if (!geos.length) {
     throw new Error('No drawable geometry was recognised in this YDD. Open it in OpenIV or CodeWalker and export the component as OBJ instead.');
   }
+  resolveUVLayouts(geos, 0);
   const textures = scanTextures(rsc);   // some YDDs carry embedded textures
   return { geos, textures, rsc, components };
 }
@@ -6000,6 +6792,11 @@ async function importModelFile(file) {
     }
     rawModelGeos = geos;
     rawModelMulti = multiTex;
+    rawModelZUp = zUp;
+    rawModelName = file.name;
+    uvLayoutRank = 0;
+    uvRanks = new Map();
+    forcedTexDoc = null;
     setModel(geos, { zUp, name: file.name, multiTex });
     refreshUVOverlay();
     uvVisible = true;
@@ -6258,7 +7055,19 @@ $('#btnHelp').addEventListener('click', () => {
     </ol>
     <h4>2 &middot; Edit</h4>
     <ol>
-      <li>Turn on <b>UV map</b> to see where each panel lands &mdash; the overlay filters itself to the texture you are editing.</li>
+      <li>Parts whose shader points only at a mask (an opacity map for a roller shutter, a flat swatch the game colours itself)
+      are drawn plain grey rather than being made invisible &mdash; paint that texture and it appears on the model straight away.</li>
+      <li>Each part shows the texture its shader actually asks for. If the part you want stays grey or shows the wrong sheet,
+      switch to that texture's tab and hit <b>Show this on model</b> to pin it onto the bodywork.</li>
+      <li>The UV overlay draws the <b>outline of each panel</b> rather than every triangle &mdash; a vehicle body runs to tens of thousands
+      of triangles and the full mesh is an unreadable haze. Hit <b>Dense</b> if you do want every edge.</li>
+      <li>Turn on <b>UV map</b> to see where each panel lands &mdash; click it again to show every part, not just the ones using this texture.</li>
+      <li><b>Fix UV</b> now only affects the parts wearing the texture you are editing, so you can set the body one way and the
+      cab another and both stay put &mdash; no more flipping back and forth. <b>Auto UV</b> resets everything.</li>
+      <li><b>Fix UV</b> is a last resort, not a first step &mdash; the automatic layout is derived from the vertex format and is almost always right.
+      A wrong layout often looks <i>cleaner</i> (everything samples one flat colour) while quietly losing all the artwork, so if panels go plain
+      after cycling, hit <b>Auto UV</b> to go back. The toast tells you how much of the sheet each layout actually uses; higher is better.</li>
+      <li>If the wireframe clearly does not match the model, hit <b>Fix UV</b>. Vertex layouts vary between vehicles and the reader picks the most likely one; this steps through the runner-ups until the mapping snaps into place.</li>
       <li>Paint, mask, clone, blend. The 3D preview updates live and every open texture shows on its correct parts.</li>
       <li><b>3D eyedropper</b> (in the <kbd>I</kbd> stack): click it, then click the model &mdash; the 2D view jumps to that exact pixel. Fastest way to work out which bit of the sheet is which panel.</li>
     </ol>
@@ -6290,6 +7099,12 @@ $('#btnHelp').addEventListener('click', () => {
     <kbd>Ctrl</kbd>+<kbd>E</kbd> merge down &middot; <kbd>Ctrl</kbd>+<kbd>J</kbd> duplicate &middot; <kbd>Del</kbd> clear selection &middot;
     <kbd>Enter</kbd> commit a crop or path &middot; <kbd>Esc</kbd> cancel &middot; <kbd>Space</kbd>+drag pan &middot;
     <kbd>Alt</kbd>+click sample or set a source &middot; <kbd>Shift</kbd>+click straight line.</p>
+    <h4>Resizing artwork</h4>
+    <p>Pick <b>Free transform</b> (<kbd>V</kbd> stack, or <kbd>Ctrl</kbd>+<kbd>T</kbd>) and a box appears around the active layer &mdash;
+    or around the selection, if you have one. <b>Corners</b> resize, <b>sides</b> stretch that one axis, and the grip above the box rotates.
+    Hold <kbd>Shift</kbd> on a corner to keep the proportions, <kbd>Alt</kbd> to work from the centre. Type exact width, height, scale %,
+    position or angle in the options bar. <kbd>Enter</kbd> or clicking away applies it, <kbd>Esc</kbd> cancels.
+    Text and decals stay editable after resizing &mdash; they are not flattened.</p>
     <h4>Recolouring a vehicle fast</h4>
     <p>Pick the <b>Replace colour</b> bucket (<kbd>G</kbd> stack), choose the new colour, then click the colour you want gone &mdash;
     it swaps that colour across the whole texture in one go. Leave <b>Match</b> on <i>Shades of it</i> so shadows and highlights of the
